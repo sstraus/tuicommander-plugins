@@ -1,6 +1,6 @@
 # TUI Commander Plugin Registry
 
-Community plugin registry for [TUI Commander](https://github.com/sstraus/tui-commander).
+Community plugin registry for [TUICommander](https://github.com/sstraus/tuicommander).
 
 ## registry.json
 
@@ -45,4 +45,4 @@ Open a PR adding your entry to `registry.json`. Make sure:
 
 ## Plugin development
 
-See the [TUI Commander plugin docs](https://github.com/sstraus/tui-commander/blob/main/docs/plugins.md) for the full API reference, examples, and the `manifest.json` format.
+See the [TUICommander plugin docs](https://github.com/sstraus/tuicommander/blob/main/docs/plugins.md) for the full API reference, examples, and the `manifest.json` format.
