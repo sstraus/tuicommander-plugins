@@ -1,2 +1,13 @@
 [
+  {
+    "id": "mdkb-dashboard",
+    "name": "mdkb Dashboard",
+    "description": "View mdkb knowledge base status, collections, memories, and configuration in an interactive panel.",
+    "author": "sstraus",
+    "repo": "sstraus/tuicommander-plugins",
+    "latestVersion": "1.0.0",
+    "minAppVersion": "0.3.0",
+    "capabilities": ["exec:cli", "fs:read", "ui:panel", "ui:ticker"],
+    "downloadUrl": "https://github.com/sstraus/tuicommander-plugins/releases/latest/download/mdkb-dashboard.zip"
+  }
 ]
