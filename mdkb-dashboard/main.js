@@ -24,7 +24,7 @@ let panelRef = null;
 // ---------------------------------------------------------------------------
 
 async function fetchMdkbData(host, repoPath) {
-  const results = { status: null, stats: null, memories: null, config: null, error: null };
+  const results = { status: null, stats: null, memories: null, codeInfo: null, config: null, error: null };
 
   try {
     const [statusRaw, statsRaw, memoriesRaw] = await Promise.all([
@@ -38,6 +38,14 @@ async function fetchMdkbData(host, repoPath) {
   } catch (err) {
     results.error = err.message || String(err);
     host.log("warn", "Failed to fetch mdkb data", { error: results.error });
+  }
+
+  // Code index info (may not exist)
+  try {
+    const codeRaw = await host.execCli("mdkb", ["--format", "json", "code", "info"], repoPath);
+    results.codeInfo = JSON.parse(codeRaw);
+  } catch {
+    results.codeInfo = null;
   }
 
   // Read config separately (may not exist)
@@ -183,6 +191,30 @@ function renderDashboard(data, repoPath) {
     `);
   }
 
+  // --- Code Index card ---
+  if (data.codeInfo) {
+    const ci = data.codeInfo;
+    sections.push(`
+      <div class="card">
+        <h2>Code Index</h2>
+        <div class="stats-grid">
+          <div class="stat">
+            <span class="stat-value">${ci.files}</span>
+            <span class="stat-label">Files</span>
+          </div>
+          <div class="stat">
+            <span class="stat-value">${ci.symbols}</span>
+            <span class="stat-label">Symbols</span>
+          </div>
+          <div class="stat">
+            <span class="stat-value">${ci.relationships}</span>
+            <span class="stat-label">Relationships</span>
+          </div>
+        </div>
+      </div>
+    `);
+  }
+
   // --- Stats card ---
   if (stats) {
     const agg = stats.aggregate;
@@ -249,14 +281,7 @@ function buildPage(repoName, body) {
 <head>
 <meta charset="utf-8">
 <style>
-  * { box-sizing: border-box; margin: 0; padding: 0; }
-  html, body {
-    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-    font-size: 13px;
-    line-height: 1.5;
-    color: #c9d1d9;
-    background: #0d1117;
-  }
+  /* Plugin-specific — base styles inherited from TUICommander */
   .dashboard {
     max-width: 860px;
     margin: 0 auto;
@@ -264,116 +289,77 @@ function buildPage(repoName, body) {
   }
   h1 {
     font-size: 18px;
-    font-weight: 600;
-    color: #e6edf3;
-    margin-bottom: 16px;
     display: flex;
     align-items: center;
     gap: 8px;
   }
-  h1 .repo-name { color: #58a6ff; }
-  h2 {
-    font-size: 14px;
-    font-weight: 600;
-    color: #e6edf3;
-    margin-bottom: 12px;
-  }
-  h2 .count { font-weight: 400; color: #8b949e; }
+  h1 .repo-name { color: var(--accent, #59a8dd); }
+  h2 .count { font-weight: 400; color: var(--fg-muted, #9aa1a9); }
   h3 {
-    font-size: 12px;
-    font-weight: 600;
-    color: #8b949e;
     text-transform: uppercase;
     letter-spacing: 0.05em;
     margin: 16px 0 8px;
   }
   .card {
-    background: #161b22;
-    border: 1px solid #30363d;
-    border-radius: 6px;
     padding: 16px;
     margin-bottom: 12px;
   }
   .error-card {
-    border-color: #f85149;
-    background: #1c1014;
+    border-color: var(--error, #f48771);
+    background: color-mix(in srgb, var(--error) 10%, var(--bg-primary));
   }
-  .error-card h2 { color: #f85149; }
+  .error-card h2 { color: var(--error, #f48771); }
   .stats-grid {
     display: grid;
-    grid-template-columns: repeat(4, 1fr);
+    grid-template-columns: repeat(auto-fit, minmax(100px, 1fr));
     gap: 12px;
     margin-bottom: 8px;
   }
   .stat {
     text-align: center;
     padding: 8px;
-    background: #0d1117;
+    background: var(--bg-primary, #1e1e1e);
     border-radius: 4px;
-    border: 1px solid #21262d;
+    border: 1px solid var(--border, #3e3e42);
   }
   .stat-value {
     display: block;
     font-size: 20px;
     font-weight: 700;
-    color: #58a6ff;
+    color: var(--accent, #59a8dd);
   }
   .stat-label {
     display: block;
     font-size: 11px;
-    color: #8b949e;
+    color: var(--fg-muted, #9aa1a9);
     text-transform: uppercase;
     letter-spacing: 0.05em;
     margin-top: 2px;
   }
-  table {
-    width: 100%;
-    border-collapse: collapse;
-    font-size: 12px;
-  }
   table.compact { font-size: 11px; }
-  th {
-    text-align: left;
-    font-weight: 600;
-    color: #8b949e;
-    padding: 6px 8px;
-    border-bottom: 1px solid #30363d;
-    font-size: 11px;
-    text-transform: uppercase;
-    letter-spacing: 0.03em;
-  }
-  td {
-    padding: 5px 8px;
-    border-bottom: 1px solid #21262d;
-    vertical-align: top;
-  }
   tr:last-child td { border-bottom: none; }
   .right { text-align: right; }
-  .mono { font-family: 'SF Mono', 'Cascadia Code', Consolas, monospace; font-size: 11px; }
-  .muted { color: #8b949e; }
+  .mono { font-family: "JetBrains Mono", "Fira Code", "Cascadia Code", monospace; font-size: 11px; }
+  .muted { color: var(--fg-muted, #9aa1a9); }
   .badge {
-    display: inline-block;
-    font-size: 10px;
-    font-weight: 500;
-    padding: 1px 6px;
     border-radius: 10px;
     text-transform: uppercase;
     letter-spacing: 0.03em;
   }
-  .badge-manual { background: #1f2937; color: #9ca3af; }
-  .badge-convention { background: #1e3a2f; color: #3fb950; }
-  .badge-library { background: #1e293b; color: #58a6ff; }
-  .badge-sessions { background: #2d1f3d; color: #bc8cff; }
-  .badge-type-red { background: #3d1418; color: #f85149; }
-  .badge-type-blue { background: #121d2f; color: #58a6ff; }
-  .badge-type-green { background: #122117; color: #3fb950; }
-  .badge-type-gray { background: #1f2937; color: #9ca3af; }
+  .badge-manual { background: var(--bg-tertiary, #2d2d30); color: var(--fg-muted, #9aa1a9); }
+  .badge-convention { background: color-mix(in srgb, var(--success) 15%, var(--bg-primary)); color: var(--success, #4ec9b0); }
+  .badge-library { background: color-mix(in srgb, var(--accent) 15%, var(--bg-primary)); color: var(--accent, #59a8dd); }
+  .badge-sessions { background: color-mix(in srgb, var(--merged, #a371f7) 15%, var(--bg-primary)); color: var(--merged, #a371f7); }
+  .badge-type-red { background: color-mix(in srgb, var(--error) 15%, var(--bg-primary)); color: var(--error, #f48771); }
+  .badge-type-blue { background: color-mix(in srgb, var(--accent) 15%, var(--bg-primary)); color: var(--accent, #59a8dd); }
+  .badge-type-green { background: color-mix(in srgb, var(--success) 15%, var(--bg-primary)); color: var(--success, #4ec9b0); }
+  .badge-type-gray { background: var(--bg-tertiary, #2d2d30); color: var(--fg-muted, #9aa1a9); }
   .tag {
     display: inline-block;
     font-size: 10px;
     padding: 0 4px;
-    background: #21262d;
-    color: #8b949e;
+    background: var(--bg-tertiary, #2d2d30);
+    color: var(--fg-muted, #9aa1a9);
     border-radius: 3px;
     margin-right: 3px;
     margin-bottom: 2px;
@@ -381,33 +367,26 @@ function buildPage(repoName, body) {
   .tags-cell { max-width: 200px; }
   .last-updated {
     font-size: 11px;
-    color: #8b949e;
+    color: var(--fg-muted, #9aa1a9);
     margin-top: 8px;
-  }
-  .hint {
-    font-size: 11px;
-    color: #8b949e;
-    margin-top: 8px;
-    font-style: italic;
   }
   pre.config-block {
-    background: #0d1117;
-    border: 1px solid #21262d;
+    background: var(--bg-primary, #1e1e1e);
+    border: 1px solid var(--border, #3e3e42);
     border-radius: 4px;
     padding: 12px;
-    font-family: 'SF Mono', 'Cascadia Code', Consolas, monospace;
+    font-family: "JetBrains Mono", "Fira Code", "Cascadia Code", monospace;
     font-size: 11px;
     line-height: 1.6;
     overflow-x: auto;
     white-space: pre-wrap;
     word-break: break-all;
-    color: #c9d1d9;
   }
   .icon-inline {
     width: 16px;
     height: 16px;
     vertical-align: middle;
-    fill: #58a6ff;
+    fill: var(--accent, #59a8dd);
   }
 </style>
 </head>
@@ -427,16 +406,17 @@ function buildPage(repoName, body) {
 // Ticker
 // ---------------------------------------------------------------------------
 
-function updateTicker(host, status) {
+function updateTicker(host, status, codeInfo) {
   if (!status || !status.index) {
     host.clearTicker("mdkb-status");
     return;
   }
   const idx = status.index;
   const staleTag = idx.stale_documents > 0 ? ` (${idx.stale_documents} stale)` : "";
+  const codePart = codeInfo ? ` · ${codeInfo.symbols} sym` : "";
   host.setTicker({
     id: "mdkb-status",
-    text: `${idx.documents} docs · ${idx.collections} collections${staleTag}`,
+    text: `${idx.documents} docs · ${idx.collections} coll${staleTag}${codePart}`,
     label: "mdkb",
     icon: DB_ICON,
     priority: 5, // low tier — popover only
@@ -527,7 +507,7 @@ async function openDashboard(host) {
 
   // Also update ticker with latest data
   if (data.status) {
-    updateTicker(host, data.status);
+    updateTicker(host, data.status, data.codeInfo);
   }
 }
 
@@ -539,9 +519,13 @@ async function refreshTicker(host) {
   }
 
   try {
-    const raw = await host.execCli("mdkb", ["--format", "json", "status"], repo.path);
-    const status = JSON.parse(raw);
-    updateTicker(host, status);
+    const [statusRaw, codeRaw] = await Promise.allSettled([
+      host.execCli("mdkb", ["--format", "json", "status"], repo.path),
+      host.execCli("mdkb", ["--format", "json", "code", "info"], repo.path),
+    ]);
+    const status = statusRaw.status === "fulfilled" ? JSON.parse(statusRaw.value) : null;
+    const codeInfo = codeRaw.status === "fulfilled" ? JSON.parse(codeRaw.value) : null;
+    updateTicker(host, status, codeInfo);
   } catch {
     host.clearTicker("mdkb-status");
   }
