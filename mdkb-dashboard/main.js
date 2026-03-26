@@ -434,24 +434,10 @@ export default {
   onload(host) {
     hostRef = host;
 
-    // Activity Center section
-    host.registerSection({
-      id: SECTION_ID,
-      label: "KNOWLEDGE BASE",
-      priority: 50,
-      canDismissAll: false,
-    });
-
-    // Persistent activity item to open the dashboard
-    host.addItem({
-      id: "mdkb:dashboard",
-      pluginId: PLUGIN_ID,
-      sectionId: SECTION_ID,
-      title: "mdkb Dashboard",
-      subtitle: "View knowledge base status",
-      icon: DB_ICON,
-      dismissible: false,
-      onClick: () => openDashboard(host),
+    host.registerTerminalAction({
+      id: "open-mdkb-dashboard",
+      label: "mdkb Dashboard",
+      action: () => openDashboard(host),
     });
 
     // Initial ticker update

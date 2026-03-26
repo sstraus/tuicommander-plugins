@@ -10,6 +10,7 @@
     "exec:cli",
     "fs:read",
     "ui:panel",
-    "ui:ticker"
+    "ui:ticker",
+    "ui:context-menu"
   ]
 }
