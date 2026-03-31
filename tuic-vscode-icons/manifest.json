@@ -2,7 +2,7 @@
   "id": "tuic-vscode-icons",
   "name": "VSCode Icons",
   "version": "1.0.0",
-  "minAppVersion": "0.9.9",
+  "minAppVersion": "0.9.8",
   "main": "main.js",
   "description": "1500+ file and folder icons from the vscode-icons project (CC BY-SA 4.0). Source: https://github.com/vscode-icons/vscode-icons",
   "author": "TUICommander",
