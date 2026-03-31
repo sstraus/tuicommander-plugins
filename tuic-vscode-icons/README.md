@@ -8,7 +8,7 @@ Provides `resolveFileIcon` via the `ui:file-icons` plugin capability. The file b
 
 ## Icon set
 
-The original vscode-icons project ships 1500+ icons covering every file format imaginable. That's overkill for a terminal/AI coding tool, so the icon set has been **pruned to ~615 icons** focused on what developers actually encounter:
+The original vscode-icons project ships 1500+ icons covering every file format imaginable. That's overkill for a terminal/AI coding tool, so the icon set has been **pruned to ~870 icons** focused on what developers actually encounter:
 
 - Programming languages (TypeScript, Python, Rust, Go, Java, C/C++, Ruby, etc.)
 - Config and build files (package.json, Cargo.toml, Makefile, Dockerfile, tsconfig, etc.)
@@ -30,11 +30,9 @@ The original vscode-icons project ships 1500+ icons covering every file format i
 - Font files (otf, ttf, woff, eot)
 - Niche/legacy formats (QlikView, MediaWiki, Fitbit, etc.)
 
-Additionally, icons larger than 15 KB (e.g. Lerna at 215 KB, Composer at 95 KB) are excluded — a generic icon is preferable to a single SVG that weighs more than hundreds of others combined.
+All SVGs are aggressively optimized with [svgo](https://github.com/svg/svgo) (multipass, floatPrecision=1) — these are 16x16 icons, fine detail is invisible at that size.
 
-All remaining SVGs are optimized with [svgo](https://github.com/svg/svgo) (multipass).
-
-**Result:** `icon-data.js` went from 2.2 MB to 1.0 MB (53% smaller).
+**Result:** `icon-data.js` went from 2.9 MB (full set with language extensions) to 1.2 MB (-59%).
 
 ## Files
 
@@ -52,15 +50,17 @@ All remaining SVGs are optimized with [svgo](https://github.com/svg/svgo) (multi
 To update from a newer vscode-icons release:
 
 ```bash
-# 1. Extract full set from vscode-icons clone
+# 1. Extract full set from vscode-icons clone (includes language extensions)
 node scripts/extract.mjs /path/to/vscode-icons-clone
 
-# 2. Prune to dev-relevant icons and optimize with svgo
+# 2. Prune irrelevant icons and aggressively optimize SVGs for 16x16 display
 node scripts/prune.mjs
 
 # Dry run to preview changes without writing:
 node scripts/prune.mjs --dry-run
 ```
+
+The extraction script parses both `supportedExtensions.ts` and `languages.ts` from vscode-icons to capture all file extension mappings, including language-based ones (e.g. `.ts`, `.py`, `.rs`).
 
 ## License
 

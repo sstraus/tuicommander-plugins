@@ -20,32 +20,59 @@ if (!vsiconsRoot) {
 
 const extFile = readFileSync(join(vsiconsRoot, "src/iconsManifest/supportedExtensions.ts"), "utf8");
 const folderFile = readFileSync(join(vsiconsRoot, "src/iconsManifest/supportedFolders.ts"), "utf8");
+const langFile = readFileSync(join(vsiconsRoot, "src/iconsManifest/languages.ts"), "utf8");
+
+// ---- Parse languages.ts to build language-key → knownExtensions map ----
+const langExtMap = {};
+const langRegex = /(\w+):\s*\{[^}]*knownExtensions:\s*\[([^\]]*)\]/g;
+let match;
+while ((match = langRegex.exec(langFile)) !== null) {
+  const langKey = match[1];
+  const exts = match[2].match(/'([^']+)'/g)?.map(s => s.replace(/'/g, "")) ?? [];
+  if (exts.length) langExtMap[langKey] = exts;
+}
+console.log(`Parsed ${Object.keys(langExtMap).length} language definitions`);
 
 // ---- Parse file extensions ----
 // Each entry looks like: { icon: 'typescript', extensions: ['ts', 'tsx'], ... }
 // or { icon: 'docker', extensions: ['dockerfile'], filename: true, ... }
+// or { icon: 'go', extensions: [], languages: [languages.go], ... }
 const fileExtensions = {};
 const fileNames = {};
 
-// Match icon entries: { icon: '...', extensions: [...], ... }
+// Match icon entries: { icon: '...', ... }
+// Use a more robust regex that captures the full entry block
 const extRegex = /\{\s*icon:\s*'([^']+)'[\s\S]*?extensions:\s*\[([^\]]*)\][\s\S]*?\}/g;
-let match;
 while ((match = extRegex.exec(extFile)) !== null) {
   const iconName = match[1];
   const extensions = match[2].match(/'([^']+)'/g)?.map(s => s.replace(/'/g, "")) ?? [];
 
-  // Check if this is a filename match
   const entryText = match[0];
   const isFilename = /filename:\s*true/.test(entryText);
   const isDisabled = /disabled:\s*true/.test(entryText);
 
   if (isDisabled) continue;
 
+  // Collect extensions from the extensions array
   for (const ext of extensions) {
     if (isFilename) {
       fileNames[ext.toLowerCase()] = `file_type_${iconName}`;
     } else {
       fileExtensions[ext.toLowerCase()] = `file_type_${iconName}`;
+    }
+  }
+
+  // Collect extensions from languages references (e.g. languages: [languages.go])
+  const langRefs = entryText.match(/languages\.(\w+)/g);
+  if (langRefs) {
+    for (const ref of langRefs) {
+      const langKey = ref.replace("languages.", "");
+      const langExts = langExtMap[langKey];
+      if (langExts) {
+        for (const ext of langExts) {
+          fileExtensions[ext.toLowerCase()] = `file_type_${iconName}`;
+        }
+      }
     }
   }
 

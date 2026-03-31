@@ -206,50 +206,82 @@ const jsonStart = iconDataSrc.indexOf("{");
 const jsonEnd = iconDataSrc.lastIndexOf("}") + 1;
 const allIcons = JSON.parse(iconDataSrc.slice(jsonStart, jsonEnd));
 
-// Cap: replace SVGs larger than MAX_ICON_KB with the default file/folder icon.
-// Bloated SVGs (lerna=215KB, composer=95KB) aren't worth the payload for a
-// terminal file browser — a generic icon is fine.
-const MAX_ICON_BYTES = 15 * 1024;
-let capped = 0;
-
 const prunedIcons = {};
 for (const [name, svg] of Object.entries(allIcons)) {
-  if (!referencedIcons.has(name)) continue;
-  if (svg.length > MAX_ICON_BYTES && name !== "default_file" && name !== "default_folder" && name !== "default_folder_opened") {
-    capped++;
-    // Don't include — resolveFileIcon will fall through to default
-    continue;
+  if (referencedIcons.has(name)) {
+    prunedIcons[name] = svg;
   }
-  prunedIcons[name] = svg;
-}
-
-// Remove map entries that point to capped (missing) icons so they fall back to default
-for (const [ext, icon] of Object.entries(iconMap.fileExtensions)) {
-  if (!prunedIcons[icon]) delete iconMap.fileExtensions[ext];
-}
-for (const [fn, icon] of Object.entries(iconMap.fileNames)) {
-  if (!prunedIcons[icon]) delete iconMap.fileNames[fn];
-}
-for (const [fld, icon] of Object.entries(iconMap.folderNames)) {
-  if (!prunedIcons[icon]) delete iconMap.folderNames[fld];
 }
 
 const iconsBefore = Object.keys(allIcons).length;
 const iconsAfter = Object.keys(prunedIcons).length;
-console.log(`Icons:      ${iconsBefore} → ${iconsAfter} (removed ${iconsBefore - iconsAfter}, ${capped} capped for size)`);
+console.log(`Icons:      ${iconsBefore} → ${iconsAfter} (removed ${iconsBefore - iconsAfter})`);
 
-// ---- Optimize all SVGs with svgo (batch via temp directory) ----
+// ---- Aggressively optimize all SVGs with svgo ----
+// These icons render at 16x16 or smaller — strip all unnecessary detail.
 const tmpDir = join(root, ".svgo-tmp");
 mkdirSync(tmpDir, { recursive: true });
 
-// Write each SVG to a temp file
+// Write svgo config for aggressive small-icon optimization
+const svgoConfig = join(tmpDir, "svgo.config.mjs");
+writeFileSync(svgoConfig, `
+export default {
+  multipass: true,
+  floatPrecision: 1,
+  plugins: [
+    {
+      name: "preset-default",
+      params: {
+        overrides: {
+          // Keep viewBox (needed for scaling)
+          removeViewBox: false,
+          // Aggressive path simplification
+          convertPathData: {
+            floatPrecision: 1,
+            transformPrecision: 1,
+            makeArcs: { threshold: 2.5, tolerance: 1.0 },
+          },
+          // Merge and simplify
+          mergePaths: true,
+          convertShapeToPath: true,
+          convertTransform: { floatPrecision: 1 },
+          cleanupNumericValues: { floatPrecision: 1 },
+          // Remove editor metadata
+          removeDesc: true,
+          removeTitle: true,
+          removeComments: true,
+          removeMetadata: true,
+          removeEditorsNSData: true,
+          removeEmptyAttrs: true,
+          removeEmptyContainers: true,
+          removeEmptyText: true,
+          removeHiddenElems: true,
+          removeUnusedNS: true,
+          removeUselessDefs: true,
+          removeUselessStrokeAndFill: true,
+          removeXMLProcInst: true,
+          // Collapse groups
+          collapseGroups: true,
+          // Inline styles
+          inlineStyles: { onlyMatchedOnce: false },
+        },
+      },
+    },
+    // Remove xml:space, xmlns:xlink when not needed
+    "removeXlink",
+    // Sort attributes for better gzip
+    "sortAttrs",
+  ],
+};
+`);
+
 for (const [name, svg] of Object.entries(prunedIcons)) {
   writeFileSync(join(tmpDir, `${name}.svg`), svg);
 }
 
-console.log(`\nOptimizing ${iconsAfter} SVGs with svgo...`);
+console.log(`\nOptimizing ${iconsAfter} SVGs with svgo (aggressive, floatPrecision=1)...`);
 try {
-  execFileSync("npx", ["-y", "svgo", "--multipass", "-f", tmpDir, "-o", tmpDir], {
+  execFileSync("npx", ["-y", "svgo", "--config", svgoConfig, "-f", tmpDir, "-o", tmpDir], {
     stdio: "pipe",
     timeout: 120_000,
   });
