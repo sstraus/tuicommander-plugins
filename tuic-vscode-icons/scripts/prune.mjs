@@ -218,58 +218,28 @@ const iconsAfter = Object.keys(prunedIcons).length;
 console.log(`Icons:      ${iconsBefore} → ${iconsAfter} (removed ${iconsBefore - iconsAfter})`);
 
 // ---- Aggressively optimize all SVGs with svgo ----
-// These icons render at 16x16 or smaller — strip all unnecessary detail.
+// These icons display at 16x16 CSS pixels. Remove dimensions (let CSS
+// handle sizing via the container), keep viewBox, and simplify paths
+// at floatPrecision=1 — sub-pixel detail is invisible at this size.
 const tmpDir = join(root, ".svgo-tmp");
 mkdirSync(tmpDir, { recursive: true });
 
-// Write svgo config for aggressive small-icon optimization
 const svgoConfig = join(tmpDir, "svgo.config.mjs");
 writeFileSync(svgoConfig, `
 export default {
   multipass: true,
-  floatPrecision: 1,
   plugins: [
     {
       name: "preset-default",
       params: {
         overrides: {
-          // Keep viewBox (needed for scaling)
           removeViewBox: false,
-          // Aggressive path simplification
-          convertPathData: {
-            floatPrecision: 1,
-            transformPrecision: 1,
-            makeArcs: { threshold: 2.5, tolerance: 1.0 },
-          },
-          // Merge and simplify
-          mergePaths: true,
-          convertShapeToPath: true,
-          convertTransform: { floatPrecision: 1 },
           cleanupNumericValues: { floatPrecision: 1 },
-          // Remove editor metadata
-          removeDesc: true,
-          removeTitle: true,
-          removeComments: true,
-          removeMetadata: true,
-          removeEditorsNSData: true,
-          removeEmptyAttrs: true,
-          removeEmptyContainers: true,
-          removeEmptyText: true,
-          removeHiddenElems: true,
-          removeUnusedNS: true,
-          removeUselessDefs: true,
-          removeUselessStrokeAndFill: true,
-          removeXMLProcInst: true,
-          // Collapse groups
-          collapseGroups: true,
-          // Inline styles
-          inlineStyles: { onlyMatchedOnce: false },
+          convertPathData: { floatPrecision: 1 },
         },
       },
     },
-    // Remove xml:space, xmlns:xlink when not needed
-    "removeXlink",
-    // Sort attributes for better gzip
+    { name: "removeDimensions" },
     "sortAttrs",
   ],
 };
@@ -279,7 +249,7 @@ for (const [name, svg] of Object.entries(prunedIcons)) {
   writeFileSync(join(tmpDir, `${name}.svg`), svg);
 }
 
-console.log(`\nOptimizing ${iconsAfter} SVGs with svgo (aggressive, floatPrecision=1)...`);
+console.log(`\nOptimizing ${iconsAfter} SVGs with svgo...`);
 try {
   execFileSync("npx", ["-y", "svgo", "--config", svgoConfig, "-f", tmpDir, "-o", tmpDir], {
     stdio: "pipe",
@@ -301,6 +271,40 @@ for (const name of Object.keys(prunedIcons)) {
 // Cleanup
 rmSync(tmpDir, { recursive: true, force: true });
 console.log(`SVGO saved: ${(savedBytes / 1024).toFixed(0)} KB across ${iconsAfter} icons`);
+
+// ---- Simplify paths with svg-path-simplify ----
+// Reduces Bézier nodes that are invisible at 16x16. SVGO optimizes syntax
+// and precision; this step removes geometrically redundant control points.
+const allIconEntries = Object.entries(prunedIcons);
+
+if (allIconEntries.length > 0) {
+  console.log(`\nSimplifying paths on ${allIconEntries.length} icons...`);
+
+  // Polyfill DOMParser for svg-path-simplify (browser-only module)
+  const { JSDOM } = await import("jsdom");
+  const dom = new JSDOM("");
+  globalThis.DOMParser = dom.window.DOMParser;
+  globalThis.XMLSerializer = dom.window.XMLSerializer;
+  globalThis.document = dom.window.document;
+
+  const { svgPathSimplify } = await import("svg-path-simplify");
+
+  let simplifiedCount = 0;
+  let simplifiedBytes = 0;
+  for (const [name, svg] of allIconEntries) {
+    try {
+      const result = svgPathSimplify(svg, { tolerance: 1.0, decimals: 1 });
+      if (result.length < svg.length) {
+        simplifiedBytes += svg.length - result.length;
+        simplifiedCount++;
+        prunedIcons[name] = result;
+      }
+    } catch {
+      // Skip icons that fail (e.g. unusual SVG structure)
+    }
+  }
+  console.log(`Path simplify: ${simplifiedCount} icons, saved ${(simplifiedBytes / 1024).toFixed(0)} KB`);
+}
 
 const mapJson = JSON.stringify(iconMap, null, 2);
 const dataJs =

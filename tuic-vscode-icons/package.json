@@ -1,0 +1,16 @@
+{
+  "name": "tuic-vscode-icons",
+  "version": "1.0.0",
+  "description": "File and folder icon theme plugin for TUICommander, based on icons from the [vscode-icons](https://github.com/vscode-icons/vscode-icons) project.",
+  "main": "main.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "devDependencies": {
+    "jsdom": "^29.0.1",
+    "svg-path-simplify": "^0.4.3"
+  }
+}

@@ -30,12 +30,18 @@ export default {
         if (exactIcon && ICONS[exactIcon]) return ICONS[exactIcon];
 
         // Then by extension
-        const dotIdx = name.lastIndexOf(".");
+        const lc = name.toLowerCase();
+        const dotIdx = lc.lastIndexOf(".");
         if (dotIdx > 0) {
-          const ext = name.slice(dotIdx + 1).toLowerCase();
+          const ext = lc.slice(dotIdx + 1);
           const extIcon = iconMap.fileExtensions[ext];
           if (extIcon && ICONS[extIcon]) return ICONS[extIcon];
         }
+
+        // Try full filename as extension (handles extensionless files
+        // like "Makefile", "Dockerfile" mapped as extensions in vscode-icons)
+        const fullIcon = iconMap.fileExtensions[lc];
+        if (fullIcon && ICONS[fullIcon]) return ICONS[fullIcon];
 
         // Default file icon
         return ICONS[iconMap.defaultFile] ?? null;
