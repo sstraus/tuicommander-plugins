@@ -9,5 +9,16 @@
     "minAppVersion": "0.3.0",
     "capabilities": ["exec:cli", "fs:read", "ui:panel", "ui:ticker"],
     "downloadUrl": "https://github.com/sstraus/tuicommander-plugins/releases/latest/download/mdkb-dashboard.zip"
+  },
+  {
+    "id": "tuic-vscode-icons",
+    "name": "VSCode Icons",
+    "description": "1500+ file and folder icons from the vscode-icons project (CC BY-SA 4.0)",
+    "author": "sstraus",
+    "repo": "sstraus/tuicommander",
+    "latestVersion": "1.0.0",
+    "minAppVersion": "0.9.9",
+    "capabilities": ["ui:file-icons"],
+    "downloadUrl": "https://github.com/sstraus/tuicommander/releases/latest/download/tuic-vscode-icons.zip"
   }
 ]
