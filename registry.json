@@ -20,5 +20,16 @@
     "minAppVersion": "0.9.8",
     "capabilities": ["ui:file-icons"],
     "downloadUrl": "https://github.com/sstraus/tuicommander-plugins/releases/latest/download/tuic-vscode-icons.zip"
+  },
+  {
+    "id": "cache-keepalive",
+    "name": "Cache Keepalive",
+    "description": "Prevents Claude API prompt cache expiry by sending minimal keepalive messages during idle periods.",
+    "author": "sstraus",
+    "repo": "sstraus/tuicommander-plugins",
+    "latestVersion": "1.0.0",
+    "minAppVersion": "0.9.8",
+    "capabilities": ["pty:write", "ui:ticker"],
+    "downloadUrl": "https://github.com/sstraus/tuicommander-plugins/releases/latest/download/cache-keepalive.zip"
   }
 ]
