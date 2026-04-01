@@ -7,6 +7,9 @@
  *
  * Default: sends up to 3 keepalives per idle stretch (~4.5 min apart),
  * extending cache life from 5 min to ~23 min total.
+ *
+ * Verification: after each keepalive, reads the Claude Code session JSONL
+ * to confirm cache hit/miss from actual API token usage.
  */
 
 const PLUGIN_ID = "cache-keepalive";
@@ -14,25 +17,24 @@ const PLUGIN_ID = "cache-keepalive";
 const ICON = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="currentColor"><path d="M8 1a7 7 0 1 0 0 14A7 7 0 0 0 8 1zm-.5 3a.5.5 0 0 1 1 0v3.5H11a.5.5 0 0 1 0 1H8a.5.5 0 0 1-.5-.5V4z"/></svg>';
 const SECTION_ID = "cache-keepalive";
 
+/** Claude Code stores sessions in ~/.claude/projects/<path-with-dashes>/<uuid>.jsonl */
+const CLAUDE_PROJECTS_DIR = "~/.claude/projects";
+
 /** Opus pricing per million tokens */
 const PRICING = {
   inputPerM: 15.0,
   cacheWritePerM: 18.75, // 1.25x
   cacheReadPerM: 1.5, // 0.1x
+  outputPerM: 75.0,
 };
 
 // ── Configuration ────────────────────────────────────────────────────
 
 const DEFAULTS = {
-  /** Cache TTL in ms (Anthropic default: 5 min) */
   ttlMs: 5 * 60 * 1000,
-  /** Send keepalive this many ms before TTL expires */
   marginMs: 30 * 1000,
-  /** Max keepalives per idle stretch before giving up */
   maxKeepalives: 3,
-  /** How often to check sessions (ms) */
   checkIntervalMs: 30 * 1000,
-  /** Message sent to terminal — shortest possible to trigger API call */
   message: ".",
 };
 
@@ -44,6 +46,7 @@ class SessionTracker {
     this.keepaliveCount = 0;
     this.pendingKeepalive = false;
     this.shellState = null;
+    this.repoPath = null;
   }
 }
 
@@ -55,13 +58,11 @@ class Stats {
     this.totalHit = 0;
     this.totalMiss = 0;
     this.totalUnknown = 0;
-    /** Total cache_read tokens from keepalive responses (confirms cache was warm) */
     this.totalCacheReadTokens = 0;
-    /** Total cache_creation tokens from keepalive responses (cache was cold — miss) */
     this.totalCacheCreationTokens = 0;
-    /** Total output tokens spent on keepalive responses */
+    this.totalInputTokens = 0;
     this.totalOutputTokens = 0;
-    this.history = []; // last 20: { ts, session, result, cacheRead, cacheCreation, output }
+    this.history = [];
   }
 
   record(sessionId, result, tokens) {
@@ -72,6 +73,7 @@ class Stats {
     if (tokens) {
       this.totalCacheReadTokens += tokens.cacheRead ?? 0;
       this.totalCacheCreationTokens += tokens.cacheCreation ?? 0;
+      this.totalInputTokens += tokens.input ?? 0;
       this.totalOutputTokens += tokens.output ?? 0;
     }
     this.history.push({
@@ -80,21 +82,20 @@ class Stats {
       result,
       ...(tokens ?? {}),
     });
-    if (this.history.length > 20) this.history.shift();
+    if (this.history.length > 50) this.history.shift();
   }
 
-  /** Estimate savings: keepalive hit costs 0.1x vs full-price cache miss */
   get savings() {
-    // Each cache_read token cost 0.1x instead of 1x.
-    // Savings = cacheRead * (inputPrice - cacheReadPrice) per token
-    const saved =
+    // Without keepalive, cache_read tokens would have been full-price input
+    const savedInput =
       (this.totalCacheReadTokens / 1_000_000) *
       (PRICING.inputPerM - PRICING.cacheReadPerM);
-    // Keepalive cost = cache_read cost + output cost
+    // Keepalive cost: cache read + new input + output
     const keepaliveCost =
       (this.totalCacheReadTokens / 1_000_000) * PRICING.cacheReadPerM +
-      (this.totalOutputTokens / 1_000_000) * PRICING.inputPerM; // output priced at 5x but let's use input as proxy
-    return { saved: Math.max(0, saved), cost: keepaliveCost };
+      (this.totalInputTokens / 1_000_000) * PRICING.inputPerM +
+      (this.totalOutputTokens / 1_000_000) * PRICING.outputPerM;
+    return { saved: Math.max(0, savedInput), cost: keepaliveCost };
   }
 
   toJSON() {
@@ -105,6 +106,7 @@ class Stats {
       totalUnknown: this.totalUnknown,
       totalCacheReadTokens: this.totalCacheReadTokens,
       totalCacheCreationTokens: this.totalCacheCreationTokens,
+      totalInputTokens: this.totalInputTokens,
       totalOutputTokens: this.totalOutputTokens,
       history: this.history,
     };
@@ -112,13 +114,7 @@ class Stats {
 
   static fromJSON(obj) {
     const s = new Stats();
-    s.totalSent = obj.totalSent ?? 0;
-    s.totalHit = obj.totalHit ?? 0;
-    s.totalMiss = obj.totalMiss ?? 0;
-    s.totalUnknown = obj.totalUnknown ?? 0;
-    s.totalCacheReadTokens = obj.totalCacheReadTokens ?? 0;
-    s.totalCacheCreationTokens = obj.totalCacheCreationTokens ?? 0;
-    s.totalOutputTokens = obj.totalOutputTokens ?? 0;
+    Object.assign(s, obj);
     s.history = obj.history ?? [];
     return s;
   }
@@ -126,25 +122,12 @@ class Stats {
 
 // ── Module state ─────────────────────────────────────────────────────
 
-/** @type {Map<string, SessionTracker>} */
 const sessions = new Map();
 let checkTimer = null;
 let hostRef = null;
 let config = { ...DEFAULTS };
 let stats = new Stats();
-
-/**
- * Sessions awaiting verification after keepalive.
- * @type {Map<string, number>} sessionId → keepalive timestamp
- */
-const pendingVerification = new Map();
-
-/**
- * Temporary token accumulator for pending verifications.
- * Output watchers fire per-line so we accumulate before final tally.
- * @type {Map<string, {cacheRead:number, cacheCreation:number, output:number}>}
- */
-const pendingTokens = new Map();
+let homePath = null;
 
 function getSession(sessionId) {
   let s = sessions.get(sessionId);
@@ -166,35 +149,150 @@ function saveStats() {
     .catch(() => {});
 }
 
-function updateDashboard() {
-  if (!hostRef) return;
-  const { saved, cost } = stats.savings;
-  const hitRate =
-    stats.totalSent > 0
-      ? Math.round((stats.totalHit / stats.totalSent) * 100)
-      : 0;
-  const net = saved - cost;
-
-  let subtitle = `${stats.totalSent} sent`;
-  if (stats.totalHit > 0 || stats.totalMiss > 0) {
-    subtitle += `, ${hitRate}% hit rate`;
-  }
-  if (saved > 0) {
-    subtitle += ` — est. $${net.toFixed(2)} net saved`;
-  }
-
-  hostRef.updateItem(`${PLUGIN_ID}:dashboard`, { subtitle });
-}
-
 function fmtTokens(n) {
+  if (n == null) return "-";
   if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
   if (n >= 1_000) return `${(n / 1_000).toFixed(1)}k`;
   return String(n);
 }
 
 function fmtDollars(n) {
-  return n < 0.01 && n > 0 ? "<$0.01" : `$${n.toFixed(2)}`;
+  if (n < 0.005 && n > 0) return "<$0.01";
+  return `$${n.toFixed(2)}`;
 }
+
+function updateDashboard() {
+  if (!hostRef) return;
+  const { saved, cost } = stats.savings;
+  const net = saved - cost;
+  const hitRate =
+    stats.totalSent > 0
+      ? Math.round((stats.totalHit / stats.totalSent) * 100)
+      : 0;
+
+  let subtitle = `${stats.totalSent} sent`;
+  if (stats.totalHit > 0 || stats.totalMiss > 0) {
+    subtitle += `, ${hitRate}% hit`;
+  }
+  if (net > 0.005) {
+    subtitle += ` — ${fmtDollars(net)} saved`;
+  }
+
+  hostRef.updateItem(`${PLUGIN_ID}:dashboard`, { subtitle });
+}
+
+// ── JSONL reading ────────────────────────────────────────────────────
+
+/**
+ * Derive Claude Code project directory from a repo path.
+ * /Users/foo/bar → -Users-foo-bar
+ */
+function repoPathToClaudeDir(repoPath) {
+  return repoPath.replace(/\//g, "-");
+}
+
+/**
+ * After keepalive response completes, read the last assistant entry
+ * from the most recently modified JSONL in the project directory.
+ */
+async function verifyFromJSONL(sessionId, repoPath) {
+  if (!hostRef || !repoPath) {
+    stats.record(sessionId, "unknown", null);
+    saveStats();
+    updateDashboard();
+    return;
+  }
+
+  try {
+    const claudeDir = repoPathToClaudeDir(repoPath);
+    const projectDir = `${homePath}/.claude/projects/${claudeDir}`;
+
+    // List JSONL files to find the most recent
+    const files = await hostRef.listDirectory(projectDir, "*.jsonl");
+    if (!files || files.length === 0) {
+      hostRef.log("warn", `No JSONL files in ${projectDir}`);
+      stats.record(sessionId, "unknown", null);
+      saveStats();
+      updateDashboard();
+      return;
+    }
+
+    // Read tail of each file to find the most recently written one.
+    // In practice, the active session's file is the most recent.
+    // We try the last few files sorted alphabetically (UUIDs, so order ≈ random).
+    // Better approach: read tail of ALL and pick the one with the latest timestamp.
+    // For efficiency, just try each file's tail until we find an assistant entry.
+    let bestTokens = null;
+    let bestTs = 0;
+
+    // Read at most 5 files (most should be stale)
+    const filesToCheck = files.slice(-5);
+    for (const filename of filesToCheck) {
+      try {
+        const filePath = `${projectDir}/${filename}`;
+        const tail = await hostRef.readFileTail(filePath, 8192);
+        if (!tail) continue;
+
+        // Parse lines from the tail, find the last assistant entry
+        const lines = tail.split("\n").filter((l) => l.trim());
+        for (let i = lines.length - 1; i >= 0; i--) {
+          try {
+            const entry = JSON.parse(lines[i]);
+            if (entry.type !== "assistant") continue;
+            const usage = entry.message?.usage;
+            if (!usage) continue;
+
+            const ts = new Date(entry.timestamp ?? 0).getTime();
+            if (ts > bestTs) {
+              bestTs = ts;
+              bestTokens = {
+                cacheRead: usage.cache_read_input_tokens ?? 0,
+                cacheCreation: usage.cache_creation_input_tokens ?? 0,
+                input: usage.input_tokens ?? 0,
+                output: usage.output_tokens ?? 0,
+              };
+            }
+            break; // Only need last assistant entry per file
+          } catch {
+            continue;
+          }
+        }
+      } catch {
+        continue;
+      }
+    }
+
+    if (!bestTokens) {
+      hostRef.log("info", `No assistant entry found in JSONL → unknown`);
+      stats.record(sessionId, "unknown", null);
+    } else {
+      const result = bestTokens.cacheRead > bestTokens.cacheCreation ? "hit" : "miss";
+      stats.record(sessionId, result, bestTokens);
+
+      const label = result === "hit" ? "HIT" : "MISS";
+      hostRef.log(
+        "info",
+        `Cache ${label}: read=${fmtTokens(bestTokens.cacheRead)} creation=${fmtTokens(bestTokens.cacheCreation)} → ${sessionId.slice(0, 8)}`
+      );
+      hostRef.setTicker({
+        id: `${PLUGIN_ID}:status`,
+        text: `Cache ${label} (${fmtTokens(bestTokens.cacheRead)} read)`,
+        label: "Cache",
+        icon: ICON,
+        priority: result === "hit" ? 5 : 50,
+        ttlMs: 10000,
+      });
+    }
+  } catch (err) {
+    hostRef.log("warn", `JSONL read failed: ${err}`);
+    stats.record(sessionId, "unknown", null);
+  }
+
+  saveStats();
+  updateDashboard();
+}
+
+// ── Keepalive check ──────────────────────────────────────────────────
 
 function checkKeepalives() {
   if (!hostRef) return;
@@ -213,18 +311,19 @@ function checkKeepalives() {
       session.pendingKeepalive = true;
       session.keepaliveCount++;
       activeCount++;
+
+      // Resolve repo path for JSONL lookup
+      if (!session.repoPath) {
+        session.repoPath = hostRef.getRepoPathForSession(sessionId);
+      }
+
       const count = session.keepaliveCount;
       const max = config.maxKeepalives;
 
-      pendingVerification.set(sessionId, now);
-      pendingTokens.set(sessionId, { cacheRead: 0, cacheCreation: 0, output: 0 });
-
       hostRef.writePty(sessionId, config.message + "\n").catch((err) => {
-        hostRef.log("error", `Keepalive failed for ${sessionId}: ${err}`);
+        hostRef.log("error", `Keepalive failed: ${err}`);
         session.pendingKeepalive = false;
         session.keepaliveCount--;
-        pendingVerification.delete(sessionId);
-        pendingTokens.delete(sessionId);
       });
 
       hostRef.log("info", `Keepalive ${count}/${max} → ${sessionId.slice(0, 8)}`);
@@ -246,53 +345,28 @@ function checkKeepalives() {
   }
 }
 
-/** Finalize verification for a session — called on idle or timeout */
-function finalizeVerification(sessionId) {
-  if (!pendingVerification.has(sessionId)) return;
-  pendingVerification.delete(sessionId);
-  const tokens = pendingTokens.get(sessionId);
-  pendingTokens.delete(sessionId);
-
-  const cacheRead = tokens?.cacheRead ?? 0;
-  const cacheCreation = tokens?.cacheCreation ?? 0;
-  const hasData = cacheRead > 0 || cacheCreation > 0;
-
-  let result;
-  if (!hasData) {
-    result = "unknown";
-  } else if (cacheRead > cacheCreation) {
-    result = "hit";
-  } else {
-    result = "miss";
-  }
-
-  stats.record(sessionId, result, tokens);
-  saveStats();
-  updateDashboard();
-
-  if (hostRef) {
-    const label = result === "hit" ? "HIT" : result === "miss" ? "MISS" : "?";
-    const detail = hasData ? ` (read: ${fmtTokens(cacheRead)})` : "";
-    hostRef.log("info", `Keepalive verified: cache ${label}${detail} → ${sessionId.slice(0, 8)}`);
-
-    if (hasData) {
-      hostRef.setTicker({
-        id: `${PLUGIN_ID}:status`,
-        text: `Cache ${label}${detail}`,
-        label: "Cache",
-        icon: ICON,
-        priority: result === "hit" ? 5 : 50,
-        ttlMs: 8000,
-      });
-    }
-  }
-}
+// ── Plugin lifecycle ─────────────────────────────────────────────────
 
 export default {
   id: PLUGIN_ID,
 
   onload(host) {
     hostRef = host;
+
+    // Resolve home path for JSONL access
+    // Plugin API paths must be absolute, so we need $HOME
+    try {
+      const repo = host.getActiveRepo();
+      if (repo?.path) {
+        // Extract home from a known path like /Users/foo/Gits/...
+        const match = repo.path.match(/^(\/Users\/[^/]+|\/home\/[^/]+)/);
+        if (match) homePath = match[1];
+      }
+    } catch {}
+    if (!homePath) {
+      // Fallback: assume macOS default
+      homePath = "/Users/" + (typeof process !== "undefined" ? process.env?.USER : "unknown");
+    }
 
     // ── Load persisted data ──────────────────────────────────────
     host
@@ -344,63 +418,47 @@ export default {
 
         let md = "# Cache Keepalive Analytics\n\n";
 
-        // ── Savings summary ──
-        md += "## Cost Impact\n\n";
+        md += "## Cost Impact (Opus pricing)\n\n";
         md += "| Metric | Value |\n|--------|-------|\n";
-        md += `| Est. savings (avoided cache misses) | ${fmtDollars(saved)} |\n`;
-        md += `| Keepalive cost (cache reads + output) | ${fmtDollars(cost)} |\n`;
-        md += `| **Net savings** | **${fmtDollars(net)}** |\n`;
-        md += "\n";
-        md += `*Savings estimated using Opus pricing: $15/M input, $1.50/M cache read, $18.75/M cache write.*\n\n`;
+        md += `| Avoided cache miss savings | ${fmtDollars(saved)} |\n`;
+        md += `| Keepalive cost | ${fmtDollars(cost)} |\n`;
+        md += `| **Net savings** | **${fmtDollars(net)}** |\n\n`;
+        md += "*Each keepalive hit pays 0.1x instead of the 1x that a cache miss would cost on the next real turn.*\n\n";
 
-        // ── Token breakdown ──
         md += "## Token Breakdown\n\n";
         md += "| Metric | Tokens |\n|--------|--------|\n";
-        md += `| Cache read (kept warm) | ${fmtTokens(stats.totalCacheReadTokens)} |\n`;
-        md += `| Cache creation (rebuilt) | ${fmtTokens(stats.totalCacheCreationTokens)} |\n`;
+        md += `| Cache read (warm) | ${fmtTokens(stats.totalCacheReadTokens)} |\n`;
+        md += `| Cache creation (cold) | ${fmtTokens(stats.totalCacheCreationTokens)} |\n`;
+        md += `| Input (new) | ${fmtTokens(stats.totalInputTokens)} |\n`;
         md += `| Output (responses) | ${fmtTokens(stats.totalOutputTokens)} |\n`;
 
-        // ── Hit/miss ──
         md += "\n## Effectiveness\n\n";
         md += "| Metric | Value |\n|--------|-------|\n";
         md += `| Keepalives sent | ${stats.totalSent} |\n`;
-        md += `| Cache hits | ${stats.totalHit} |\n`;
+        md += `| Cache hits (read > creation) | ${stats.totalHit} |\n`;
         md += `| Cache misses | ${stats.totalMiss} |\n`;
-        md += `| Unknown (no data) | ${stats.totalUnknown} |\n`;
-        md += `| Hit rate | ${hitRate}% |\n`;
+        md += `| Unverified | ${stats.totalUnknown} |\n`;
+        md += `| **Hit rate** | **${hitRate}%** |\n`;
 
-        // ── Config ──
         md += "\n## Configuration\n\n";
         md += "| Setting | Value |\n|---------|-------|\n";
         md += `| Cache TTL | ${config.ttlMs / 1000}s |\n`;
-        md += `| Margin before expiry | ${config.marginMs / 1000}s |\n`;
-        md += `| Max keepalives per pause | ${config.maxKeepalives} |\n`;
-        md += `| Keepalive message | \`${config.message}\` |\n`;
-        md += `| Check interval | ${config.checkIntervalMs / 1000}s |\n`;
+        md += `| Send margin | ${config.marginMs / 1000}s before expiry |\n`;
+        md += `| Max per pause | ${config.maxKeepalives} |\n`;
+        md += `| Message | \`${config.message}\` |\n`;
 
-        // ── Recent history ──
         if (stats.history.length > 0) {
-          md += "\n## Recent History (last 20)\n\n";
-          md += "| Time | Session | Result | Cache Read | Cache Write |\n";
-          md += "|------|---------|--------|------------|-------------|\n";
-          for (const h of [...stats.history].reverse()) {
+          md += "\n## Recent History\n\n";
+          md += "| Time | Session | Result | Cache Read | Cache Write | Output |\n";
+          md += "|------|---------|--------|------------|-------------|--------|\n";
+          for (const h of [...stats.history].reverse().slice(0, 20)) {
             const r = h.result === "hit" ? "HIT" : h.result === "miss" ? "MISS" : "?";
-            const cr = h.cacheRead != null ? fmtTokens(h.cacheRead) : "-";
-            const cc = h.cacheCreation != null ? fmtTokens(h.cacheCreation) : "-";
-            md += `| ${h.ts.slice(11, 19)} | ${h.session} | ${r} | ${cr} | ${cc} |\n`;
+            md += `| ${h.ts.slice(11, 19)} | ${h.session} | ${r} | ${fmtTokens(h.cacheRead)} | ${fmtTokens(h.cacheCreation)} | ${fmtTokens(h.output)} |\n`;
           }
         }
 
-        // ── Manual verification ──
-        md += "\n## Manual Verification\n\n";
-        md += "Check Claude Code session JSONL for cache token breakdown:\n\n";
-        md += "```bash\n";
-        md += "# Last 5 responses with cache breakdown\n";
-        md += 'tail -20 ~/.claude/projects/*/conversation.jsonl | \\\n';
-        md += '  grep -o \'"cache_read_input_tokens":[0-9]*\\|"cache_creation_input_tokens":[0-9]*\'\n';
-        md += "```\n\n";
-        md += "A keepalive cache **hit** shows high `cache_read_input_tokens` and zero/low `cache_creation_input_tokens`.\n";
-        md += "A cache **miss** shows the opposite: high creation, low read.\n";
+        md += "\n---\n*Data source: Claude Code session JSONL (`~/.claude/projects/`). ";
+        md += "Verification reads `message.usage.cache_read_input_tokens` from the last assistant entry.*\n";
 
         return md;
       },
@@ -415,8 +473,8 @@ export default {
       if (payload.state === "idle") {
         if (session.pendingKeepalive) {
           session.pendingKeepalive = false;
-          // Finalize verification after a short delay to let output watchers capture tokens
-          setTimeout(() => finalizeVerification(sessionId), 3000);
+          // Wait a moment for CC to flush JSONL, then verify
+          setTimeout(() => verifyFromJSONL(sessionId, session.repoPath), 2000);
         } else if (prev === "busy") {
           session.keepaliveCount = 0;
         }
@@ -424,40 +482,9 @@ export default {
       }
     });
 
-    // ── Token capture from terminal output ───────────────────────
-    // Claude Code prints usage info with cache breakdown.
-    // We capture cache_read and cache_creation tokens to verify hits.
-    host.registerOutputWatcher({
-      pattern: /cache[_\s]?read[_\s]?input[_\s]?tokens[\s:"]*(\d+)/i,
-      onMatch(match, sessionId) {
-        const tokens = pendingTokens.get(sessionId);
-        if (tokens) tokens.cacheRead = parseInt(match[1], 10);
-      },
-    });
-
-    host.registerOutputWatcher({
-      pattern: /cache[_\s]?creation[_\s]?input[_\s]?tokens[\s:"]*(\d+)/i,
-      onMatch(match, sessionId) {
-        const tokens = pendingTokens.get(sessionId);
-        if (tokens) tokens.cacheCreation = parseInt(match[1], 10);
-      },
-    });
-
-    host.registerOutputWatcher({
-      pattern: /output[_\s]?tokens[\s:"]*(\d+)/i,
-      onMatch(match, sessionId) {
-        const tokens = pendingTokens.get(sessionId);
-        if (tokens) tokens.output = parseInt(match[1], 10);
-      },
-    });
-
-    // ── Timeout fallback: finalize after 15s if shell-state idle not received ──
-    // (e.g., if CC hangs or output is too fast)
-    // This is handled per-keepalive in checkKeepalives via pendingVerification map.
-
     // Start periodic check
     checkTimer = setInterval(checkKeepalives, config.checkIntervalMs);
-    host.log("info", "Cache keepalive active");
+    host.log("info", `Active — home=${homePath}`);
   },
 
   onunload() {
@@ -466,8 +493,6 @@ export default {
       checkTimer = null;
     }
     sessions.clear();
-    pendingVerification.clear();
-    pendingTokens.clear();
     hostRef = null;
   },
 };

@@ -99,5 +99,5 @@ Or manually: copy `manifest.json` and `main.js` to `~/Library/Application Suppor
 ## Requirements
 
 - TUICommander v0.9.8+
-- Capabilities: `pty:write`, `ui:ticker`
+- Capabilities: `pty:write`, `ui:ticker`, `fs:read`, `fs:list`
 - Only activates for Claude Code sessions (`agentTypes: ["claude"]`)

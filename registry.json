@@ -29,7 +29,7 @@
     "repo": "sstraus/tuicommander-plugins",
     "latestVersion": "1.0.0",
     "minAppVersion": "0.9.8",
-    "capabilities": ["pty:write", "ui:ticker"],
+    "capabilities": ["pty:write", "ui:ticker", "fs:read", "fs:list"],
     "downloadUrl": "https://github.com/sstraus/tuicommander-plugins/releases/latest/download/cache-keepalive.zip"
   }
 ]
