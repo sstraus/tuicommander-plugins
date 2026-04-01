@@ -40,9 +40,13 @@ const DEFAULTS = {
 
 // ── Per-session state ────────────────────────────────────────────────
 
+/** Minimum busy duration (ms) to count as real activity vs tab-switch noise */
+const MIN_BUSY_DURATION_MS = 3000;
+
 class SessionTracker {
   constructor() {
     this.lastIdleAt = 0;
+    this.lastBusyAt = 0;
     this.keepaliveCount = 0;
     this.pendingKeepalive = false;
     this.shellState = null;
@@ -470,15 +474,40 @@ export default {
       const prev = session.shellState;
       session.shellState = payload.state;
 
+      if (payload.state === "busy") {
+        session.lastBusyAt = Date.now();
+        return;
+      }
+
       if (payload.state === "idle") {
         if (session.pendingKeepalive) {
+          // Idle after our keepalive response — verify and reset timer
           session.pendingKeepalive = false;
-          // Wait a moment for CC to flush JSONL, then verify
+          session.lastIdleAt = Date.now();
           setTimeout(() => verifyFromJSONL(sessionId, session.repoPath), 2000);
-        } else if (prev === "busy") {
-          session.keepaliveCount = 0;
+          return;
         }
-        session.lastIdleAt = Date.now();
+
+        if (prev === "busy") {
+          // Only treat as real activity if busy for > MIN_BUSY_DURATION_MS.
+          // Short busy blips (< 3s) are tab-switch or state-sync artifacts.
+          const busyDuration = session.lastBusyAt
+            ? Date.now() - session.lastBusyAt
+            : 0;
+          if (busyDuration >= MIN_BUSY_DURATION_MS) {
+            // Real user activity — reset keepalive counter
+            session.keepaliveCount = 0;
+            session.lastIdleAt = Date.now();
+          }
+          // Short busy: don't touch lastIdleAt or count — timer continues
+          return;
+        }
+
+        // prev was null (first time seeing session) or already idle (re-sync):
+        // set lastIdleAt only if not already tracking
+        if (session.lastIdleAt === 0) {
+          session.lastIdleAt = Date.now();
+        }
       }
     });
 
