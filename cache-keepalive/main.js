@@ -325,9 +325,15 @@ function checkKeepalives() {
       const max = config.maxKeepalives;
 
       hostRef.writePty(sessionId, config.message + "\n").catch((err) => {
-        hostRef.log("error", `Keepalive failed: ${err}`);
-        session.pendingKeepalive = false;
-        session.keepaliveCount--;
+        const msg = String(err);
+        if (msg.includes("not found") || msg.includes("No such session")) {
+          hostRef.log("info", `Session ${sessionId.slice(0, 8)} closed — removing from tracking`);
+          sessions.delete(sessionId);
+        } else {
+          hostRef.log("error", `Keepalive failed: ${err}`);
+          session.pendingKeepalive = false;
+          session.keepaliveCount--;
+        }
       });
 
       hostRef.log("info", `Keepalive ${count}/${max} → ${sessionId.slice(0, 8)}`);
@@ -468,6 +474,21 @@ export default {
       },
     });
 
+    // ── Agent lifecycle — initialize tracking when agent is detected ──
+    host.onStateChange((event) => {
+      if (event.type === "agent-started" && event.sessionId) {
+        const session = getSession(event.sessionId);
+        if (session.lastIdleAt === 0) {
+          session.lastIdleAt = Date.now();
+        }
+        host.log("info", `Agent started in ${event.sessionId.slice(0, 8)} — tracking`);
+      }
+      if (event.type === "agent-stopped" && event.sessionId) {
+        sessions.delete(event.sessionId);
+        host.log("info", `Agent stopped in ${event.sessionId.slice(0, 8)} — removed`);
+      }
+    });
+
     // ── Shell state tracking ─────────────────────────────────────
     host.registerStructuredEventHandler("shell-state", (payload, sessionId) => {
       const session = getSession(sessionId);
@@ -508,6 +529,14 @@ export default {
         if (session.lastIdleAt === 0) {
           session.lastIdleAt = Date.now();
         }
+      }
+    });
+
+    // Clean up tracking when a session is closed
+    host.registerStructuredEventHandler("session-closed", (_payload, sessionId) => {
+      if (sessions.has(sessionId)) {
+        host.log("info", `Session ${sessionId.slice(0, 8)} closed — removing from tracking`);
+        sessions.delete(sessionId);
       }
     });
 
