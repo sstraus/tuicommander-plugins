@@ -5,9 +5,9 @@
     "description": "View mdkb knowledge base status, collections, memories, and configuration in an interactive panel.",
     "author": "sstraus",
     "repo": "sstraus/tuicommander-plugins",
-    "latestVersion": "1.0.0",
+    "latestVersion": "1.1.0",
     "minAppVersion": "0.3.0",
-    "capabilities": ["exec:cli", "fs:read", "ui:panel", "ui:ticker"],
+    "capabilities": ["exec:cli", "fs:read", "ui:panel", "ui:ticker", "ui:context-menu"],
     "downloadUrl": "https://github.com/sstraus/tuicommander-plugins/releases/latest/download/mdkb-dashboard.zip"
   },
   {
@@ -15,10 +15,10 @@
     "name": "VSCode Icons",
     "description": "1500+ file and folder icons from the vscode-icons project (CC BY-SA 4.0)",
     "author": "sstraus",
-    "repo": "sstraus/tuicommander",
+    "repo": "sstraus/tuicommander-plugins",
     "latestVersion": "1.0.0",
-    "minAppVersion": "0.9.9",
+    "minAppVersion": "0.9.8",
     "capabilities": ["ui:file-icons"],
-    "downloadUrl": "https://github.com/sstraus/tuicommander/releases/latest/download/tuic-vscode-icons.zip"
+    "downloadUrl": "https://github.com/sstraus/tuicommander-plugins/releases/latest/download/tuic-vscode-icons.zip"
   }
 ]
