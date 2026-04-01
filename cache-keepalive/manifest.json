@@ -1,0 +1,11 @@
+{
+  "id": "cache-keepalive",
+  "name": "Cache Keepalive",
+  "version": "1.0.0",
+  "minAppVersion": "0.9.8",
+  "main": "main.js",
+  "description": "Prevents Claude API prompt cache expiry by sending minimal keepalive messages during idle periods. Sliding 5-min TTL resets on each hit.",
+  "author": "TUICommander",
+  "capabilities": ["pty:write", "ui:ticker"],
+  "agentTypes": ["claude"]
+}
