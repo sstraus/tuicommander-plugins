@@ -324,17 +324,17 @@ function checkKeepalives() {
       const count = session.keepaliveCount;
       const max = config.maxKeepalives;
 
-      hostRef.writePty(sessionId, config.message + "\n").catch((err) => {
-        const msg = String(err);
-        if (msg.includes("not found") || msg.includes("No such session")) {
-          hostRef.log("info", `Session ${sessionId.slice(0, 8)} closed — removing from tracking`);
-          sessions.delete(sessionId);
-        } else {
-          hostRef.log("error", `Keepalive failed: ${err}`);
-          session.pendingKeepalive = false;
-          session.keepaliveCount--;
-        }
-      });
+      hostRef.sendAgentInput(sessionId, config.message).catch((err) => {
+          const msg = String(err);
+          if (msg.includes("not found") || msg.includes("No such session")) {
+            hostRef.log("info", `Session ${sessionId.slice(0, 8)} closed — removing from tracking`);
+            sessions.delete(sessionId);
+          } else {
+            hostRef.log("error", `Keepalive failed: ${err}`);
+            session.pendingKeepalive = false;
+            session.keepaliveCount--;
+          }
+        });
 
       hostRef.log("info", `Keepalive ${count}/${max} → ${sessionId.slice(0, 8)}`);
       hostRef.setTicker({
