@@ -53,15 +53,6 @@ class SessionTracker {
     this.repoPath = null;
     /** Epoch ms when usage resets, null = not rate-limited */
     this.rateLimitedUntilMs = null;
-    /** setTimeout handle for auto-resume at reset time */
-    this.resumeTimer = null;
-  }
-
-  clearResumeTimer() {
-    if (this.resumeTimer !== null) {
-      clearTimeout(this.resumeTimer);
-      this.resumeTimer = null;
-    }
   }
 }
 
@@ -496,8 +487,6 @@ export default {
         host.log("info", `Agent started in ${event.sessionId.slice(0, 8)} — tracking`);
       }
       if (event.type === "agent-stopped" && event.sessionId) {
-        const s = sessions.get(event.sessionId);
-        if (s) s.clearResumeTimer();
         sessions.delete(event.sessionId);
         host.log("info", `Agent stopped in ${event.sessionId.slice(0, 8)} — removed`);
       }
@@ -514,7 +503,6 @@ export default {
         // User manually resumed — clear rate limit state
         if (session.rateLimitedUntilMs !== null) {
           session.rateLimitedUntilMs = null;
-          session.clearResumeTimer();
           host.log("info", `Rate limit cleared (user resumed) → ${sessionId.slice(0, 8)}`);
           host.clearTicker(`${PLUGIN_ID}:status`);
         }
@@ -565,7 +553,6 @@ export default {
 
       // Stop further keepalives by maxing out the counter
       session.keepaliveCount = config.maxKeepalives;
-      session.clearResumeTimer();
 
       host.log("warn", `Usage exhausted → ${sessionId.slice(0, 8)} — keepalives paused, reset_time="${payload.reset_time ?? "unknown"}"`);
       host.setTicker({
@@ -582,7 +569,6 @@ export default {
     host.registerStructuredEventHandler("session-closed", (_payload, sessionId) => {
       const s = sessions.get(sessionId);
       if (s) {
-        s.clearResumeTimer();
         host.log("info", `Session ${sessionId.slice(0, 8)} closed — removing from tracking`);
         sessions.delete(sessionId);
       }
@@ -597,9 +583,6 @@ export default {
     if (checkTimer) {
       clearInterval(checkTimer);
       checkTimer = null;
-    }
-    for (const session of sessions.values()) {
-      session.clearResumeTimer();
     }
     sessions.clear();
     hostRef = null;
