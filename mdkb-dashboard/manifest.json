@@ -12,5 +12,6 @@
     "ui:panel",
     "ui:ticker",
     "ui:context-menu"
-  ]
+  ],
+  "binaries": ["mdkb"]
 }

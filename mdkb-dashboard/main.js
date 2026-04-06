@@ -95,178 +95,163 @@ function relativeTime(unixTs) {
   return Math.floor(diff / 86400) + "d ago";
 }
 
+function statCard(value, label) {
+  return `
+    <div class="dash-stat">
+      <div class="dash-stat-label">${label}</div>
+      <div class="dash-stat-value">${value}</div>
+    </div>`;
+}
+
 function renderDashboard(data, repoPath) {
   const { status, stats, memories, config, error } = data;
   const repoName = repoPath.split("/").pop();
 
   if (error && !status) {
     return buildPage(repoName, `
-      <div class="card error-card">
-        <h2>mdkb not available</h2>
-        <p>${esc(error)}</p>
-        <p class="hint">Make sure <code>mdkb</code> is installed and the project has been initialized with <code>mdkb init</code>.</p>
+      <div class="dash-section">
+        <div class="empty-state">
+          <h2>mdkb not available</h2>
+          <p>${esc(error)}</p>
+          <p class="hint">Make sure <code>mdkb</code> is installed and the project has been initialized with <code>mdkb init</code>.</p>
+        </div>
       </div>
     `);
   }
 
   const sections = [];
 
-  // --- Overview card ---
+  // --- Overview section ---
   if (status) {
     const idx = status.index;
     sections.push(`
-      <div class="card">
-        <h2>Index Overview</h2>
-        <div class="stats-grid">
-          <div class="stat">
-            <span class="stat-value">${idx.documents}</span>
-            <span class="stat-label">Documents</span>
-          </div>
-          <div class="stat">
-            <span class="stat-value">${idx.stale_documents}</span>
-            <span class="stat-label">Stale</span>
-          </div>
-          <div class="stat">
-            <span class="stat-value">${idx.collections}</span>
-            <span class="stat-label">Collections</span>
-          </div>
-          <div class="stat">
-            <span class="stat-value">${formatBytes(idx.db_size_bytes)}</span>
-            <span class="stat-label">DB Size</span>
-          </div>
+      <div class="dash-section">
+        <h2 class="dash-section-title">
+          Index Overview
+          <span class="dash-section-hint">Updated ${relativeTime(idx.last_updated)}</span>
+        </h2>
+        <div class="dash-stat-grid">
+          ${statCard(idx.documents, "Documents")}
+          ${statCard(idx.stale_documents, "Stale")}
+          ${statCard(idx.collections, "Collections")}
+          ${statCard(formatBytes(idx.db_size_bytes), "DB Size")}
         </div>
-        <p class="last-updated">Last updated: ${formatDate(idx.last_updated)} <span class="muted">(${relativeTime(idx.last_updated)})</span></p>
       </div>
     `);
   }
 
-  // --- Collections card ---
+  // --- Collections section ---
   if (status && status.collections && status.collections.length > 0) {
     const rows = status.collections.map((c) => `
       <tr>
         <td><strong>${esc(c.name)}</strong></td>
-        <td class="mono">${esc(c.path)}</td>
-        <td class="mono">${esc(c.pattern)}</td>
-        <td class="right">${c.doc_count}</td>
-        <td><span class="badge badge-${c.source}">${esc(c.source)}</span></td>
+        <td><code>${esc(c.path)}</code></td>
+        <td><code>${esc(c.pattern)}</code></td>
+        <td class="num">${c.doc_count}</td>
+        <td><span class="badge badge-muted">${esc(c.source)}</span></td>
       </tr>
     `).join("");
 
     sections.push(`
-      <div class="card">
-        <h2>Collections</h2>
+      <div class="dash-section">
+        <h2 class="dash-section-title">Collections</h2>
         <table>
-          <thead><tr><th>Name</th><th>Path</th><th>Pattern</th><th class="right">Docs</th><th>Source</th></tr></thead>
+          <thead><tr><th>Name</th><th>Path</th><th>Pattern</th><th class="num">Docs</th><th>Source</th></tr></thead>
           <tbody>${rows}</tbody>
         </table>
       </div>
     `);
   }
 
-  // --- Memories card ---
+  // --- Memories section ---
   if (memories && memories.length > 0) {
     const rows = memories.slice(0, 30).map((m) => {
-      const typeBadge = { problem: "red", decision: "blue", topic: "green" }[m.entry_type] || "gray";
-      const tags = (m.tags || []).map((t) => `<span class="tag">${esc(t)}</span>`).join(" ");
+      const badgeClass = { problem: "badge-error", decision: "badge-accent", topic: "badge-success" }[m.entry_type] || "badge-muted";
+      const tags = (m.tags || []).map((t) => `<span class="badge badge-muted">${esc(t)}</span>`).join(" ");
       return `
         <tr>
-          <td class="mono">${esc(m.id)}</td>
+          <td><code>${esc(m.id)}</code></td>
           <td>${esc(m.title)}</td>
-          <td><span class="badge badge-type-${typeBadge}">${esc(m.entry_type)}</span></td>
-          <td class="right">${m.access_count || 0}</td>
-          <td class="tags-cell">${tags}</td>
+          <td><span class="badge ${badgeClass}">${esc(m.entry_type)}</span></td>
+          <td class="num">${m.access_count || 0}</td>
+          <td>${tags}</td>
         </tr>
       `;
     }).join("");
 
     sections.push(`
-      <div class="card">
-        <h2>Memories <span class="count">(${memories.length})</span></h2>
+      <div class="dash-section">
+        <h2 class="dash-section-title">
+          Memories
+          <span class="dash-section-hint">${memories.length} total${memories.length > 30 ? ", showing 30" : ""}</span>
+        </h2>
         <table>
-          <thead><tr><th>ID</th><th>Title</th><th>Type</th><th class="right">Hits</th><th>Tags</th></tr></thead>
+          <thead><tr><th>ID</th><th>Title</th><th>Type</th><th class="num">Hits</th><th>Tags</th></tr></thead>
           <tbody>${rows}</tbody>
         </table>
-        ${memories.length > 30 ? `<p class="hint">Showing 30 of ${memories.length} entries.</p>` : ""}
       </div>
     `);
   }
 
-  // --- Code Index card ---
+  // --- Code Index section ---
   if (data.codeInfo) {
     const ci = data.codeInfo;
     sections.push(`
-      <div class="card">
-        <h2>Code Index</h2>
-        <div class="stats-grid">
-          <div class="stat">
-            <span class="stat-value">${ci.files}</span>
-            <span class="stat-label">Files</span>
-          </div>
-          <div class="stat">
-            <span class="stat-value">${ci.symbols}</span>
-            <span class="stat-label">Symbols</span>
-          </div>
-          <div class="stat">
-            <span class="stat-value">${ci.relationships}</span>
-            <span class="stat-label">Relationships</span>
-          </div>
+      <div class="dash-section">
+        <h2 class="dash-section-title">Code Index</h2>
+        <div class="dash-stat-grid">
+          ${statCard(ci.files, "Files")}
+          ${statCard(ci.symbols, "Symbols")}
+          ${statCard(ci.relationships, "Relationships")}
         </div>
       </div>
     `);
   }
 
-  // --- Stats card ---
+  // --- Usage stats section ---
   if (stats) {
     const agg = stats.aggregate;
     const recentSessions = (stats.sessions || []).filter((s) => s.total_calls > 0).slice(0, 5);
 
+    const sessionsTable = recentSessions.length > 0 ? `
+      <table>
+        <thead><tr><th>Session</th><th>Started</th><th class="num">Calls</th><th class="num">Tokens</th><th>Tools</th></tr></thead>
+        <tbody>
+          ${recentSessions.map((s) => `
+            <tr>
+              <td>#${s.id}</td>
+              <td>${relativeTime(s.started_at)}</td>
+              <td class="num">${s.total_calls}</td>
+              <td class="num">${s.total_tokens.toLocaleString()}</td>
+              <td><code>${(s.tool_usage || []).map((t) => `${t.tool_name}:${t.call_count}`).join(", ") || "—"}</code></td>
+            </tr>
+          `).join("")}
+        </tbody>
+      </table>
+    ` : "";
+
     sections.push(`
-      <div class="card">
-        <h2>Usage Stats</h2>
-        <div class="stats-grid">
-          <div class="stat">
-            <span class="stat-value">${agg.total_sessions}</span>
-            <span class="stat-label">Sessions</span>
-          </div>
-          <div class="stat">
-            <span class="stat-value">${agg.total_calls}</span>
-            <span class="stat-label">Total Calls</span>
-          </div>
-          <div class="stat">
-            <span class="stat-value">${agg.total_tokens.toLocaleString()}</span>
-            <span class="stat-label">Tokens</span>
-          </div>
-          <div class="stat">
-            <span class="stat-value">${agg.avg_tokens_per_call.toFixed(1)}</span>
-            <span class="stat-label">Avg Tok/Call</span>
-          </div>
+      <div class="dash-section">
+        <h2 class="dash-section-title">Usage Stats</h2>
+        <div class="dash-stat-grid">
+          ${statCard(agg.total_sessions, "Sessions")}
+          ${statCard(agg.total_calls, "Total Calls")}
+          ${statCard(agg.total_tokens.toLocaleString(), "Tokens")}
+          ${statCard(agg.avg_tokens_per_call.toFixed(1), "Avg Tok/Call")}
         </div>
-        ${recentSessions.length > 0 ? `
-          <h3>Recent Active Sessions</h3>
-          <table class="compact">
-            <thead><tr><th>Session</th><th>Started</th><th class="right">Calls</th><th class="right">Tokens</th><th>Tools</th></tr></thead>
-            <tbody>
-              ${recentSessions.map((s) => `
-                <tr>
-                  <td>#${s.id}</td>
-                  <td>${formatDate(s.started_at)} <span class="muted">(${relativeTime(s.started_at)})</span></td>
-                  <td class="right">${s.total_calls}</td>
-                  <td class="right">${s.total_tokens.toLocaleString()}</td>
-                  <td class="mono">${(s.tool_usage || []).map((t) => `${t.tool_name}:${t.call_count}`).join(", ") || "—"}</td>
-                </tr>
-              `).join("")}
-            </tbody>
-          </table>
-        ` : ""}
+        ${sessionsTable}
       </div>
     `);
   }
 
-  // --- Config card ---
+  // --- Config section ---
   if (config) {
     sections.push(`
-      <div class="card">
-        <h2>Configuration <span class="muted mono">.mdkb/config.toml</span></h2>
+      <div class="dash-section">
+        <h2 class="dash-section-title">
+          Configuration
+          <span class="dash-section-hint">.mdkb/config.toml</span>
+        </h2>
         <pre class="config-block">${esc(config)}</pre>
       </div>
     `);
@@ -281,98 +266,11 @@ function buildPage(repoName, body) {
 <head>
 <meta charset="utf-8">
 <style>
-  /* Plugin-specific — base styles inherited from TUICommander */
-  .dashboard {
-    max-width: 860px;
-    margin: 0 auto;
-    padding: 16px 20px 40px;
-  }
-  h1 {
-    font-size: 18px;
-    display: flex;
-    align-items: center;
-    gap: 8px;
-  }
-  h1 .repo-name { color: var(--accent, #59a8dd); }
-  h2 .count { font-weight: 400; color: var(--fg-muted, #9aa1a9); }
-  h3 {
-    text-transform: uppercase;
-    letter-spacing: 0.05em;
-    margin: 16px 0 8px;
-  }
-  .card {
-    padding: 16px;
-    margin-bottom: 12px;
-  }
-  .error-card {
-    border-color: var(--error, #f48771);
-    background: color-mix(in srgb, var(--error) 10%, var(--bg-primary));
-  }
-  .error-card h2 { color: var(--error, #f48771); }
-  .stats-grid {
-    display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(100px, 1fr));
-    gap: 12px;
-    margin-bottom: 8px;
-  }
-  .stat {
-    text-align: center;
-    padding: 8px;
-    background: var(--bg-primary, #1e1e1e);
-    border-radius: 4px;
-    border: 1px solid var(--border, #3e3e42);
-  }
-  .stat-value {
-    display: block;
-    font-size: 20px;
-    font-weight: 700;
-    color: var(--accent, #59a8dd);
-  }
-  .stat-label {
-    display: block;
-    font-size: 11px;
-    color: var(--fg-muted, #9aa1a9);
-    text-transform: uppercase;
-    letter-spacing: 0.05em;
-    margin-top: 2px;
-  }
-  table.compact { font-size: 11px; }
-  tr:last-child td { border-bottom: none; }
-  .right { text-align: right; }
-  .mono { font-family: "JetBrains Mono", "Fira Code", "Cascadia Code", monospace; font-size: 11px; }
-  .muted { color: var(--fg-muted, #9aa1a9); }
-  .badge {
-    border-radius: 10px;
-    text-transform: uppercase;
-    letter-spacing: 0.03em;
-  }
-  .badge-manual { background: var(--bg-tertiary, #2d2d30); color: var(--fg-muted, #9aa1a9); }
-  .badge-convention { background: color-mix(in srgb, var(--success) 15%, var(--bg-primary)); color: var(--success, #4ec9b0); }
-  .badge-library { background: color-mix(in srgb, var(--accent) 15%, var(--bg-primary)); color: var(--accent, #59a8dd); }
-  .badge-sessions { background: color-mix(in srgb, var(--merged, #a371f7) 15%, var(--bg-primary)); color: var(--merged, #a371f7); }
-  .badge-type-red { background: color-mix(in srgb, var(--error) 15%, var(--bg-primary)); color: var(--error, #f48771); }
-  .badge-type-blue { background: color-mix(in srgb, var(--accent) 15%, var(--bg-primary)); color: var(--accent, #59a8dd); }
-  .badge-type-green { background: color-mix(in srgb, var(--success) 15%, var(--bg-primary)); color: var(--success, #4ec9b0); }
-  .badge-type-gray { background: var(--bg-tertiary, #2d2d30); color: var(--fg-muted, #9aa1a9); }
-  .tag {
-    display: inline-block;
-    font-size: 10px;
-    padding: 0 4px;
-    background: var(--bg-tertiary, #2d2d30);
-    color: var(--fg-muted, #9aa1a9);
-    border-radius: 3px;
-    margin-right: 3px;
-    margin-bottom: 2px;
-  }
-  .tags-cell { max-width: 200px; }
-  .last-updated {
-    font-size: 11px;
-    color: var(--fg-muted, #9aa1a9);
-    margin-top: 8px;
-  }
+  /* Plugin-specific tweaks only — layout/cards/typography come from
+     PLUGIN_BASE_CSS (.dashboard, .dash-*). See docs/plugins-style.md. */
   pre.config-block {
-    background: var(--bg-primary, #1e1e1e);
-    border: 1px solid var(--border, #3e3e42);
+    background: var(--bg-tertiary);
+    border: 1px solid var(--border);
     border-radius: 4px;
     padding: 12px;
     font-family: "JetBrains Mono", "Fira Code", "Cascadia Code", monospace;
@@ -382,20 +280,14 @@ function buildPage(repoName, body) {
     white-space: pre-wrap;
     word-break: break-all;
   }
-  .icon-inline {
-    width: 16px;
-    height: 16px;
-    vertical-align: middle;
-    fill: var(--accent, #59a8dd);
-  }
+  .dash-title .repo-name { color: var(--accent); margin-left: 4px; }
 </style>
 </head>
 <body>
 <div class="dashboard">
-  <h1>
-    <svg class="icon-inline" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="currentColor"><path d="M1 3.5c0-1.865 2.91-3 6-3s6 1.135 6 3v9c0 1.865-2.91 3-6 3s-6-1.135-6-3v-9zm1.156 4.843C3.328 9.372 5.089 10 7 10s3.672-.628 4.844-1.657v2.157c0 .828-1.89 2-5.344 2S1.5 11.328 1.5 10.5V8.343h.156-.5.5zm0 4C3.328 13.372 5.089 14 7 14s3.672-.628 4.844-1.657V14.5c0 .828-1.89 2-5.344 2S1.5 15.328 1.5 14.5v-2.157h.156-.5.5zM7 1.5c-3.454 0-5.344 1.172-5.344 2S3.546 5.5 7 5.5s5.344-1.172 5.344-2S10.454 1.5 7 1.5zM2.156 4.843C3.328 5.872 5.089 6.5 7 6.5s3.672-.628 4.844-1.657V6.5c0 .828-1.89 2-5.344 2S1.5 7.328 1.5 6.5V4.843h.156-.5.5z"/></svg>
-    mdkb · <span class="repo-name">${esc(repoName)}</span>
-  </h1>
+  <div class="dash-header">
+    <h1 class="dash-title">mdkb <span class="repo-name">${esc(repoName)}</span></h1>
+  </div>
   ${body}
 </div>
 </body>
@@ -438,6 +330,12 @@ export default {
       id: "open-mdkb-dashboard",
       label: "mdkb Dashboard",
       action: () => openDashboard(host),
+    });
+
+    host.registerDashboard({
+      label: "mdkb",
+      icon: DB_ICON,
+      open: () => openDashboard(host),
     });
 
     // Initial ticker update

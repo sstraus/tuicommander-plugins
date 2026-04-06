@@ -6,5 +6,6 @@
   "main": "main.js",
   "description": "Prevents Claude API prompt cache expiry by sending minimal keepalive messages during idle periods. Sliding 5-min TTL resets on each hit.",
   "author": "TUICommander",
-  "capabilities": ["pty:write", "ui:ticker", "fs:read", "fs:list"]
+  "capabilities": ["pty:write", "ui:ticker", "ui:markdown", "fs:read", "fs:list"],
+  "agentTypes": ["claude"]
 }

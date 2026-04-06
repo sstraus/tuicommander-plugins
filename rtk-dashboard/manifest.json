@@ -1,0 +1,11 @@
+{
+  "id": "rtk-dashboard",
+  "name": "RTK Token Savings Dashboard",
+  "version": "1.0.0",
+  "minAppVersion": "0.3.0",
+  "main": "main.js",
+  "description": "Visualizes RTK token savings, command history, and missed optimization opportunities.",
+  "author": "TUICommander",
+  "capabilities": ["exec:cli", "ui:panel", "ui:context-menu"],
+  "binaries": ["rtk"]
+}

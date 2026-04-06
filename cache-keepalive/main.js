@@ -35,7 +35,8 @@ const DEFAULTS = {
   marginMs: 30 * 1000,
   maxKeepalives: 3,
   checkIntervalMs: 30 * 1000,
-  message: ".",
+  message: "[noop] reply .",
+  maxConsecutiveMisses: 2,
 };
 
 // ── Per-session state ────────────────────────────────────────────────
@@ -53,6 +54,12 @@ class SessionTracker {
     this.repoPath = null;
     /** Epoch ms when usage resets, null = not rate-limited */
     this.rateLimitedUntilMs = null;
+    /** Consecutive cache misses in the current idle stretch — abort when it hits maxConsecutiveMisses */
+    this.consecutiveMisses = 0;
+    /** Epoch ms when the current keepalive chain started (first ping of the idle stretch) */
+    this.chainStartedAt = 0;
+    /** Sum of cacheRead tokens verified for keepalives in the current chain */
+    this.chainCacheReadTokens = 0;
   }
 }
 
@@ -68,7 +75,23 @@ class Stats {
     this.totalCacheCreationTokens = 0;
     this.totalInputTokens = 0;
     this.totalOutputTokens = 0;
+    /** Keepalives in chains where the user returned AFTER the cache TTL — these actually saved money */
+    this.helpfulKeepalives = 0;
+    /** Keepalives in chains where the user returned WITHIN the cache TTL — wasted, cache would have stayed warm */
+    this.wastedKeepalives = 0;
+    /** Sum of cacheRead tokens from helpful keepalives only — basis for realistic savings */
+    this.helpfulCacheReadTokens = 0;
     this.history = [];
+  }
+
+  /** Called when a keepalive chain ends (real user return) — classify as helpful or wasted */
+  finalizeChain(helpful, keepaliveCount, chainCacheReadTokens) {
+    if (helpful) {
+      this.helpfulKeepalives += keepaliveCount;
+      this.helpfulCacheReadTokens += chainCacheReadTokens;
+    } else {
+      this.wastedKeepalives += keepaliveCount;
+    }
   }
 
   record(sessionId, result, tokens) {
@@ -92,16 +115,25 @@ class Stats {
   }
 
   get savings() {
-    // Without keepalive, cache_read tokens would have been full-price input
+    // Upper bound: assumes EVERY kept-warm cacheRead would have been a miss.
     const savedInput =
       (this.totalCacheReadTokens / 1_000_000) *
       (PRICING.inputPerM - PRICING.cacheReadPerM);
-    // Keepalive cost: cache read + new input + output
+    // Realistic: only count cacheReads from chains where the user returned AFTER
+    // the cache TTL — those are the keepalives that actually prevented a miss.
+    const realisticSaved =
+      (this.helpfulCacheReadTokens / 1_000_000) *
+      (PRICING.inputPerM - PRICING.cacheReadPerM);
+    // Cost is unconditional — every ping pays cache read + new input + output.
     const keepaliveCost =
       (this.totalCacheReadTokens / 1_000_000) * PRICING.cacheReadPerM +
       (this.totalInputTokens / 1_000_000) * PRICING.inputPerM +
       (this.totalOutputTokens / 1_000_000) * PRICING.outputPerM;
-    return { saved: Math.max(0, savedInput), cost: keepaliveCost };
+    return {
+      saved: Math.max(0, savedInput),
+      realisticSaved: Math.max(0, realisticSaved),
+      cost: keepaliveCost,
+    };
   }
 
   toJSON() {
@@ -114,6 +146,9 @@ class Stats {
       totalCacheCreationTokens: this.totalCacheCreationTokens,
       totalInputTokens: this.totalInputTokens,
       totalOutputTokens: this.totalOutputTokens,
+      helpfulKeepalives: this.helpfulKeepalives,
+      wastedKeepalives: this.wastedKeepalives,
+      helpfulCacheReadTokens: this.helpfulCacheReadTokens,
       history: this.history,
     };
   }
@@ -152,7 +187,9 @@ function saveStats() {
       path: "stats.json",
       content: JSON.stringify(stats.toJSON()),
     })
-    .catch(() => {});
+    .catch((err) => {
+      hostRef?.log("warn", `Stats persist failed: ${err}`);
+    });
 }
 
 function fmtTokens(n) {
@@ -169,8 +206,8 @@ function fmtDollars(n) {
 
 function updateDashboard() {
   if (!hostRef) return;
-  const { saved, cost } = stats.savings;
-  const net = saved - cost;
+  const { realisticSaved, cost } = stats.savings;
+  const net = realisticSaved - cost;
   const hitRate =
     stats.totalSent > 0
       ? Math.round((stats.totalHit / stats.totalSent) * 100)
@@ -202,7 +239,7 @@ function repoPathToClaudeDir(repoPath) {
  * from the most recently modified JSONL in the project directory.
  */
 async function verifyFromJSONL(sessionId, repoPath) {
-  if (!hostRef || !repoPath) {
+  if (!hostRef || !repoPath || !sessions.has(sessionId)) {
     stats.record(sessionId, "unknown", null);
     saveStats();
     updateDashboard();
@@ -213,8 +250,11 @@ async function verifyFromJSONL(sessionId, repoPath) {
     const claudeDir = repoPathToClaudeDir(repoPath);
     const projectDir = `${homePath}/.claude/projects/${claudeDir}`;
 
-    // List JSONL files to find the most recent
-    const files = await hostRef.listDirectory(projectDir, "*.jsonl");
+    // List JSONL files sorted by modification time (newest first).
+    // The active session file is the one Claude Code just wrote to during our keepalive,
+    // so mtime sort puts it at index 0. Without mtime sort we'd be picking files
+    // alphabetically among 100+ historical UUIDs — essentially random.
+    const files = await hostRef.listDirectory(projectDir, "*.jsonl", { sortBy: "mtime" });
     if (!files || files.length === 0) {
       hostRef.log("warn", `No JSONL files in ${projectDir}`);
       stats.record(sessionId, "unknown", null);
@@ -223,16 +263,11 @@ async function verifyFromJSONL(sessionId, repoPath) {
       return;
     }
 
-    // Read tail of each file to find the most recently written one.
-    // In practice, the active session's file is the most recent.
-    // We try the last few files sorted alphabetically (UUIDs, so order ≈ random).
-    // Better approach: read tail of ALL and pick the one with the latest timestamp.
-    // For efficiency, just try each file's tail until we find an assistant entry.
     let bestTokens = null;
     let bestTs = 0;
 
-    // Read at most 5 files (most should be stale)
-    const filesToCheck = files.slice(-5);
+    // Check the 3 most recently modified files — one of them is the active session.
+    const filesToCheck = files.slice(0, 3);
     for (const filename of filesToCheck) {
       try {
         const filePath = `${projectDir}/${filename}`;
@@ -263,7 +298,8 @@ async function verifyFromJSONL(sessionId, repoPath) {
             continue;
           }
         }
-      } catch {
+      } catch (err) {
+        hostRef.log("warn", `JSONL read failed for ${filename}: ${err}`);
         continue;
       }
     }
@@ -274,6 +310,20 @@ async function verifyFromJSONL(sessionId, repoPath) {
     } else {
       const result = bestTokens.cacheRead > bestTokens.cacheCreation ? "hit" : "miss";
       stats.record(sessionId, result, bestTokens);
+
+      // Track consecutive misses — abort logic enforced in checkKeepalives()
+      const session = sessions.get(sessionId);
+      if (session) {
+        session.chainCacheReadTokens += bestTokens.cacheRead ?? 0;
+        if (result === "hit") {
+          session.consecutiveMisses = 0;
+        } else {
+          session.consecutiveMisses++;
+          if (session.consecutiveMisses === config.maxConsecutiveMisses) {
+            hostRef.log("info", `${session.consecutiveMisses} consecutive misses → stopping keepalives for ${sessionId.slice(0, 8)}`);
+          }
+        }
+      }
 
       const label = result === "hit" ? "HIT" : "MISS";
       hostRef.log(
@@ -312,11 +362,16 @@ function checkKeepalives() {
     if (session.lastIdleAt === 0) continue;
     if (session.pendingKeepalive) continue;
     if (session.rateLimitedUntilMs !== null && now < session.rateLimitedUntilMs) continue;
+    if (session.consecutiveMisses >= config.maxConsecutiveMisses) continue;
 
     const idleMs = now - session.lastIdleAt;
     if (idleMs >= interval) {
       session.pendingKeepalive = true;
       session.keepaliveCount++;
+      if (session.chainStartedAt === 0) {
+        session.chainStartedAt = session.lastIdleAt;
+        session.chainCacheReadTokens = 0;
+      }
       activeCount++;
 
       // Resolve repo path for JSONL lookup
@@ -385,8 +440,12 @@ export default {
     host
       .invoke("read_plugin_data", { plugin_id: PLUGIN_ID, path: "config.json" })
       .then((raw) => {
-        config = { ...DEFAULTS, ...JSON.parse(raw) };
-        host.log("info", `Config: max=${config.maxKeepalives}, ttl=${config.ttlMs / 1000}s`);
+        try {
+          config = { ...DEFAULTS, ...JSON.parse(raw) };
+          host.log("info", `Config: max=${config.maxKeepalives}, ttl=${config.ttlMs / 1000}s`);
+        } catch (parseErr) {
+          host.log("warn", `Config parse failed (using defaults): ${parseErr}`);
+        }
       })
       .catch(() => {
         host.log("info", `Defaults: max=${config.maxKeepalives}, ttl=${config.ttlMs / 1000}s`);
@@ -420,10 +479,17 @@ export default {
       contentUri: `${PLUGIN_ID}:stats`,
     });
 
+    host.registerDashboard({
+      label: "Keepalive Stats",
+      icon: ICON,
+      open: () => host.openMarkdownPanel("Cache Keepalive", `${PLUGIN_ID}:stats`),
+    });
+
     host.registerMarkdownProvider(PLUGIN_ID, {
       provideContent() {
-        const { saved, cost } = stats.savings;
+        const { saved, realisticSaved, cost } = stats.savings;
         const net = saved - cost;
+        const realisticNet = realisticSaved - cost;
         const hitRate =
           stats.totalSent > 0
             ? Math.round((stats.totalHit / stats.totalSent) * 100)
@@ -432,11 +498,19 @@ export default {
         let md = "# Cache Keepalive Analytics\n\n";
 
         md += "## Cost Impact (Opus pricing)\n\n";
+        md += "| Metric | Optimistic | Realistic |\n|--------|-----------|----------|\n";
+        md += `| Avoided cache miss savings | ${fmtDollars(saved)} | ${fmtDollars(realisticSaved)} |\n`;
+        md += `| Keepalive cost | ${fmtDollars(cost)} | ${fmtDollars(cost)} |\n`;
+        md += `| **Net savings** | **${fmtDollars(net)}** | **${fmtDollars(realisticNet)}** |\n\n`;
+        md += "*Optimistic assumes every keepalive prevented a miss. Realistic only counts chains where the user returned AFTER the cache TTL — chains resolved within the TTL are classified as wasted (cache would have stayed warm without our pings).*\n\n";
+
+        md += "## Chain Effectiveness\n\n";
+        const chainTotal = stats.helpfulKeepalives + stats.wastedKeepalives;
+        const helpfulPct = chainTotal > 0 ? Math.round((stats.helpfulKeepalives / chainTotal) * 100) : 0;
         md += "| Metric | Value |\n|--------|-------|\n";
-        md += `| Avoided cache miss savings | ${fmtDollars(saved)} |\n`;
-        md += `| Keepalive cost | ${fmtDollars(cost)} |\n`;
-        md += `| **Net savings** | **${fmtDollars(net)}** |\n\n`;
-        md += "*Each keepalive hit pays 0.1x instead of the 1x that a cache miss would cost on the next real turn.*\n\n";
+        md += `| Helpful keepalives (user returned after TTL) | ${stats.helpfulKeepalives} |\n`;
+        md += `| Wasted keepalives (user returned within TTL) | ${stats.wastedKeepalives} |\n`;
+        md += `| **Helpful rate** | **${helpfulPct}%** |\n\n`;
 
         md += "## Token Breakdown\n\n";
         md += "| Metric | Tokens |\n|--------|--------|\n";
@@ -525,8 +599,24 @@ export default {
             ? Date.now() - session.lastBusyAt
             : 0;
           if (busyDuration >= MIN_BUSY_DURATION_MS) {
-            // Real user activity — reset keepalive counter
+            // Real user activity — finalize the chain for realistic-savings tracking.
+            // A chain is "helpful" if the user came back AFTER the cache TTL,
+            // meaning without keepalives the next turn would have been a miss.
+            if (session.chainStartedAt > 0 && session.keepaliveCount > 0) {
+              const elapsedSinceIdle = Date.now() - session.chainStartedAt;
+              const helpful = elapsedSinceIdle > config.ttlMs;
+              stats.finalizeChain(helpful, session.keepaliveCount, session.chainCacheReadTokens);
+              hostRef.log(
+                "info",
+                `Chain finalized: ${helpful ? "HELPFUL" : "WASTED"} (${session.keepaliveCount} pings, idle ${Math.round(elapsedSinceIdle / 1000)}s) → ${sessionId.slice(0, 8)}`
+              );
+              saveStats();
+              updateDashboard();
+            }
             session.keepaliveCount = 0;
+            session.consecutiveMisses = 0;
+            session.chainStartedAt = 0;
+            session.chainCacheReadTokens = 0;
             session.lastIdleAt = Date.now();
           }
           // Short busy: don't touch lastIdleAt or count — timer continues

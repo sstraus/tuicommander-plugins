@@ -31,5 +31,17 @@
     "minAppVersion": "0.9.8",
     "capabilities": ["pty:write", "ui:ticker", "fs:read", "fs:list"],
     "downloadUrl": "https://github.com/sstraus/tuicommander-plugins/releases/latest/download/cache-keepalive.zip"
+  },
+  {
+    "id": "rtk-dashboard",
+    "name": "RTK Token Savings Dashboard",
+    "description": "Visualizes RTK token savings, command history, and missed optimization opportunities.",
+    "author": "sstraus",
+    "repo": "sstraus/tuicommander-plugins",
+    "latestVersion": "1.0.0",
+    "minAppVersion": "0.9.9",
+    "capabilities": ["exec:cli", "ui:panel", "ui:context-menu"],
+    "binaries": ["rtk"],
+    "downloadUrl": "https://github.com/sstraus/tuicommander-plugins/releases/latest/download/rtk-dashboard.zip"
   }
 ]
