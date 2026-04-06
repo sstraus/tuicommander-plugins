@@ -17,9 +17,6 @@ const PLUGIN_ID = "cache-keepalive";
 const ICON = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="currentColor"><path d="M8 1a7 7 0 1 0 0 14A7 7 0 0 0 8 1zm-.5 3a.5.5 0 0 1 1 0v3.5H11a.5.5 0 0 1 0 1H8a.5.5 0 0 1-.5-.5V4z"/></svg>';
 const SECTION_ID = "cache-keepalive";
 
-/** Claude Code stores sessions in ~/.claude/projects/<path-with-dashes>/<uuid>.jsonl */
-const CLAUDE_PROJECTS_DIR = "~/.claude/projects";
-
 /** Opus pricing per million tokens */
 const PRICING = {
   inputPerM: 15.0,
@@ -43,6 +40,11 @@ const DEFAULTS = {
 
 /** Minimum busy duration (ms) to count as real activity vs tab-switch noise */
 const MIN_BUSY_DURATION_MS = 3000;
+/** If pendingKeepalive isn't cleared within this window, force-clear it.
+ *  Prevents deadlock when shell-state events stop reaching the plugin
+ *  (e.g. agentType detection glitch clears the type, pluginMatchesSession
+ *  returns false, and the idle-after-keepalive event never arrives). */
+const PENDING_TIMEOUT_MS = 60_000;
 
 class SessionTracker {
   constructor() {
@@ -50,6 +52,7 @@ class SessionTracker {
     this.lastBusyAt = 0;
     this.keepaliveCount = 0;
     this.pendingKeepalive = false;
+    this.pendingKeepaliveAt = 0;
     this.shellState = null;
     this.repoPath = null;
     /** Epoch ms when usage resets, null = not rate-limited */
@@ -168,7 +171,6 @@ let checkTimer = null;
 let hostRef = null;
 let config = { ...DEFAULTS };
 let stats = new Stats();
-let homePath = null;
 
 function getSession(sessionId) {
   let s = sessions.get(sessionId);
@@ -227,14 +229,6 @@ function updateDashboard() {
 // ── JSONL reading ────────────────────────────────────────────────────
 
 /**
- * Derive Claude Code project directory from a repo path.
- * /Users/foo/bar → -Users-foo-bar
- */
-function repoPathToClaudeDir(repoPath) {
-  return repoPath.replace(/\//g, "-");
-}
-
-/**
  * After keepalive response completes, read the last assistant entry
  * from the most recently modified JSONL in the project directory.
  */
@@ -247,8 +241,13 @@ async function verifyFromJSONL(sessionId, repoPath) {
   }
 
   try {
-    const claudeDir = repoPathToClaudeDir(repoPath);
-    const projectDir = `${homePath}/.claude/projects/${claudeDir}`;
+    const projectDir = await hostRef.getClaudeProjectDir(repoPath);
+    if (!projectDir) {
+      stats.record(sessionId, "unknown", null);
+      saveStats();
+      updateDashboard();
+      return;
+    }
 
     // List JSONL files sorted by modification time (newest first).
     // The active session file is the one Claude Code just wrote to during our keepalive,
@@ -340,7 +339,7 @@ async function verifyFromJSONL(sessionId, repoPath) {
       });
     }
   } catch (err) {
-    hostRef.log("warn", `JSONL read failed: ${err}`);
+    hostRef.log("warn", `JSONL read failed for ${repoPath}: ${err}`);
     stats.record(sessionId, "unknown", null);
   }
 
@@ -360,13 +359,24 @@ function checkKeepalives() {
     if (session.shellState !== "idle") continue;
     if (session.keepaliveCount >= config.maxKeepalives) continue;
     if (session.lastIdleAt === 0) continue;
-    if (session.pendingKeepalive) continue;
+    if (session.pendingKeepalive) {
+      if (session.pendingKeepaliveAt > 0 && now - session.pendingKeepaliveAt > PENDING_TIMEOUT_MS) {
+        hostRef.log("warn", `pendingKeepalive stuck for ${Math.round((now - session.pendingKeepaliveAt) / 1000)}s → force-clearing ${sessionId.slice(0, 8)}`);
+        session.pendingKeepalive = false;
+        session.pendingKeepaliveAt = 0;
+        stats.record(sessionId, "unknown", null);
+        saveStats();
+        updateDashboard();
+      }
+      continue;
+    }
     if (session.rateLimitedUntilMs !== null && now < session.rateLimitedUntilMs) continue;
     if (session.consecutiveMisses >= config.maxConsecutiveMisses) continue;
 
     const idleMs = now - session.lastIdleAt;
     if (idleMs >= interval) {
       session.pendingKeepalive = true;
+      session.pendingKeepaliveAt = now;
       session.keepaliveCount++;
       if (session.chainStartedAt === 0) {
         session.chainStartedAt = session.lastIdleAt;
@@ -390,6 +400,7 @@ function checkKeepalives() {
           } else {
             hostRef.log("error", `Keepalive failed: ${err}`);
             session.pendingKeepalive = false;
+            session.pendingKeepaliveAt = 0;
             session.keepaliveCount--;
           }
         });
@@ -420,21 +431,6 @@ export default {
 
   onload(host) {
     hostRef = host;
-
-    // Resolve home path for JSONL access
-    // Plugin API paths must be absolute, so we need $HOME
-    try {
-      const repo = host.getActiveRepo();
-      if (repo?.path) {
-        // Extract home from a known path like /Users/foo/Gits/...
-        const match = repo.path.match(/^(\/Users\/[^/]+|\/home\/[^/]+)/);
-        if (match) homePath = match[1];
-      }
-    } catch {}
-    if (!homePath) {
-      // Fallback: assume macOS default
-      homePath = "/Users/" + (typeof process !== "undefined" ? process.env?.USER : "unknown");
-    }
 
     // ── Load persisted data ──────────────────────────────────────
     host
@@ -587,6 +583,7 @@ export default {
         if (session.pendingKeepalive) {
           // Idle after our keepalive response — verify and reset timer
           session.pendingKeepalive = false;
+          session.pendingKeepaliveAt = 0;
           session.lastIdleAt = Date.now();
           setTimeout(() => verifyFromJSONL(sessionId, session.repoPath), 2000);
           return;
@@ -666,7 +663,7 @@ export default {
 
     // Start periodic check
     checkTimer = setInterval(checkKeepalives, config.checkIntervalMs);
-    host.log("info", `Active — home=${homePath}`);
+    host.log("info", "Active");
   },
 
   onunload() {
