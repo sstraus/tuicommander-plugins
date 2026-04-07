@@ -185,7 +185,7 @@ function saveStats() {
   if (!hostRef) return;
   hostRef
     .invoke("write_plugin_data", {
-      plugin_id: PLUGIN_ID,
+      pluginId: PLUGIN_ID,
       path: "stats.json",
       content: JSON.stringify(stats.toJSON()),
     })
@@ -434,7 +434,7 @@ export default {
 
     // ── Load persisted data ──────────────────────────────────────
     host
-      .invoke("read_plugin_data", { plugin_id: PLUGIN_ID, path: "config.json" })
+      .invoke("read_plugin_data", { pluginId: PLUGIN_ID, path: "config.json" })
       .then((raw) => {
         try {
           config = { ...DEFAULTS, ...JSON.parse(raw) };
@@ -448,7 +448,7 @@ export default {
       });
 
     host
-      .invoke("read_plugin_data", { plugin_id: PLUGIN_ID, path: "stats.json" })
+      .invoke("read_plugin_data", { pluginId: PLUGIN_ID, path: "stats.json" })
       .then((raw) => {
         stats = Stats.fromJSON(JSON.parse(raw));
         host.log("info", `Stats: ${stats.totalSent} sent, ${stats.totalHit} hits`);
