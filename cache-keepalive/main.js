@@ -63,6 +63,10 @@ class SessionTracker {
     this.chainStartedAt = 0;
     /** Sum of cacheRead tokens verified for keepalives in the current chain */
     this.chainCacheReadTokens = 0;
+    /** Epoch ms when the last keepalive message was sent — used to find the matching JSONL response */
+    this.lastKeepaliveSentAt = 0;
+    /** True when we're waiting to read the real user follow-up turn from JSONL */
+    this.pendingFollowUpVerify = false;
   }
 }
 
@@ -82,19 +86,39 @@ class Stats {
     this.helpfulKeepalives = 0;
     /** Keepalives in chains where the user returned WITHIN the cache TTL — wasted, cache would have stayed warm */
     this.wastedKeepalives = 0;
+    /** Keepalives in chains where session closed without user return — pure cost */
+    this.lostKeepalives = 0;
     /** Sum of cacheRead tokens from helpful keepalives only — basis for realistic savings */
     this.helpfulCacheReadTokens = 0;
+    /** Sum of cacheRead tokens from lost chains — pure cost to subtract */
+    this.lostCacheReadTokens = 0;
+    /** Times we confirmed the user's real follow-up turn had a cache hit (true saving) */
+    this.followUpHits = 0;
+    /** Times the user's real follow-up turn had a cache miss (keepalive didn't help) */
+    this.followUpMisses = 0;
     this.history = [];
   }
 
-  /** Called when a keepalive chain ends (real user return) — classify as helpful or wasted */
-  finalizeChain(helpful, keepaliveCount, chainCacheReadTokens) {
-    if (helpful) {
+  /**
+   * Called when a keepalive chain ends.
+   * @param {"helpful"|"wasted"|"lost"} kind
+   */
+  finalizeChain(kind, keepaliveCount, chainCacheReadTokens) {
+    if (kind === "helpful") {
       this.helpfulKeepalives += keepaliveCount;
       this.helpfulCacheReadTokens += chainCacheReadTokens;
-    } else {
+    } else if (kind === "wasted") {
       this.wastedKeepalives += keepaliveCount;
+    } else {
+      // lost: session closed before user returned
+      this.lostKeepalives += keepaliveCount;
+      this.lostCacheReadTokens += chainCacheReadTokens;
     }
+  }
+
+  recordFollowUp(result) {
+    if (result === "hit") this.followUpHits++;
+    else this.followUpMisses++;
   }
 
   record(sessionId, result, tokens) {
@@ -127,7 +151,10 @@ class Stats {
     const realisticSaved =
       (this.helpfulCacheReadTokens / 1_000_000) *
       (PRICING.inputPerM - PRICING.cacheReadPerM);
-    // Cost is unconditional — every ping pays cache read + new input + output.
+    // Cost of lost chains: we paid for keepalives in sessions that never returned.
+    const lostCost =
+      (this.lostCacheReadTokens / 1_000_000) * PRICING.cacheReadPerM;
+    // Unconditional keepalive overhead: new input + output tokens on every ping.
     const keepaliveCost =
       (this.totalCacheReadTokens / 1_000_000) * PRICING.cacheReadPerM +
       (this.totalInputTokens / 1_000_000) * PRICING.inputPerM +
@@ -136,6 +163,7 @@ class Stats {
       saved: Math.max(0, savedInput),
       realisticSaved: Math.max(0, realisticSaved),
       cost: keepaliveCost,
+      lostCost,
     };
   }
 
@@ -151,7 +179,11 @@ class Stats {
       totalOutputTokens: this.totalOutputTokens,
       helpfulKeepalives: this.helpfulKeepalives,
       wastedKeepalives: this.wastedKeepalives,
+      lostKeepalives: this.lostKeepalives,
       helpfulCacheReadTokens: this.helpfulCacheReadTokens,
+      lostCacheReadTokens: this.lostCacheReadTokens,
+      followUpHits: this.followUpHits,
+      followUpMisses: this.followUpMisses,
       history: this.history,
     };
   }
@@ -208,8 +240,9 @@ function fmtDollars(n) {
 
 function updateDashboard() {
   if (!hostRef) return;
-  const { realisticSaved, cost } = stats.savings;
-  const net = realisticSaved - cost;
+  const { realisticSaved, cost, lostCost } = stats.savings;
+  // Net: realistic savings minus ALL costs (keepalive overhead + lost chains)
+  const net = realisticSaved - cost - lostCost;
   const hitRate =
     stats.totalSent > 0
       ? Math.round((stats.totalHit / stats.totalSent) * 100)
@@ -219,8 +252,11 @@ function updateDashboard() {
   if (stats.totalHit > 0 || stats.totalMiss > 0) {
     subtitle += `, ${hitRate}% hit`;
   }
-  if (net > 0.005) {
-    subtitle += ` — ${fmtDollars(net)} saved`;
+  if (stats.lostKeepalives > 0) {
+    subtitle += `, ${stats.lostKeepalives} lost`;
+  }
+  if (Math.abs(net) > 0.005) {
+    subtitle += ` — ${net >= 0 ? fmtDollars(net) + " saved" : "-" + fmtDollars(-net) + " net cost"}`;
   }
 
   hostRef.updateItem(`${PLUGIN_ID}:dashboard`, { subtitle });
@@ -229,53 +265,48 @@ function updateDashboard() {
 // ── JSONL reading ────────────────────────────────────────────────────
 
 /**
- * After keepalive response completes, read the last assistant entry
- * from the most recently modified JSONL in the project directory.
+ * Read the assistant entry from JSONL that corresponds to a specific turn.
+ *
+ * Strategy: scan the 3 most-recently-modified JSONL files and find the
+ * assistant entry whose timestamp is >= sentAtMs and closest to it (i.e.
+ * the first assistant reply AFTER the keepalive was sent). This avoids
+ * accidentally picking an unrelated conversation's last entry.
+ *
+ * @param {string} sessionId
+ * @param {string} repoPath
+ * @param {number} sentAtMs  - epoch ms when the keepalive message was sent
+ * @param {boolean} [isFollowUp] - if true, we're verifying the real user turn
+ * @returns {Promise<{result: "hit"|"miss"|"unknown", tokens: object|null}>}
  */
-async function verifyFromJSONL(sessionId, repoPath) {
-  if (!hostRef || !repoPath || !sessions.has(sessionId)) {
-    stats.record(sessionId, "unknown", null);
-    saveStats();
-    updateDashboard();
-    return;
-  }
+async function readJSONLAfter(sessionId, repoPath, sentAtMs, isFollowUp = false) {
+  if (!hostRef || !repoPath) return { result: "unknown", tokens: null };
 
   try {
     const projectDir = await hostRef.getClaudeProjectDir(repoPath);
-    if (!projectDir) {
-      stats.record(sessionId, "unknown", null);
-      saveStats();
-      updateDashboard();
-      return;
-    }
+    if (!projectDir) return { result: "unknown", tokens: null };
 
-    // List JSONL files sorted by modification time (newest first).
-    // The active session file is the one Claude Code just wrote to during our keepalive,
-    // so mtime sort puts it at index 0. Without mtime sort we'd be picking files
-    // alphabetically among 100+ historical UUIDs — essentially random.
+    // Sort by mtime: active session file has the most recent write.
     const files = await hostRef.listDirectory(projectDir, "*.jsonl", { sortBy: "mtime" });
     if (!files || files.length === 0) {
       hostRef.log("warn", `No JSONL files in ${projectDir}`);
-      stats.record(sessionId, "unknown", null);
-      saveStats();
-      updateDashboard();
-      return;
+      return { result: "unknown", tokens: null };
     }
 
+    // Check the 3 most recently modified files — the active session is among them.
+    // We want the assistant entry with the smallest timestamp >= sentAtMs.
     let bestTokens = null;
-    let bestTs = 0;
+    let bestTs = Infinity;
 
-    // Check the 3 most recently modified files — one of them is the active session.
     const filesToCheck = files.slice(0, 3);
     for (const filename of filesToCheck) {
       try {
         const filePath = `${projectDir}/${filename}`;
-        const tail = await hostRef.readFileTail(filePath, 8192);
+        // Read a larger tail to make sure we have enough history to find the entry.
+        const tail = await hostRef.readFileTail(filePath, 16384);
         if (!tail) continue;
 
-        // Parse lines from the tail, find the last assistant entry
         const lines = tail.split("\n").filter((l) => l.trim());
-        for (let i = lines.length - 1; i >= 0; i--) {
+        for (let i = 0; i < lines.length; i++) {
           try {
             const entry = JSON.parse(lines[i]);
             if (entry.type !== "assistant") continue;
@@ -283,7 +314,9 @@ async function verifyFromJSONL(sessionId, repoPath) {
             if (!usage) continue;
 
             const ts = new Date(entry.timestamp ?? 0).getTime();
-            if (ts > bestTs) {
+            // We want the first assistant entry that came AFTER the send time.
+            // Allow a 2s window before sentAtMs to tolerate clock skew.
+            if (ts >= sentAtMs - 2000 && ts < bestTs) {
               bestTs = ts;
               bestTokens = {
                 cacheRead: usage.cache_read_input_tokens ?? 0,
@@ -292,7 +325,6 @@ async function verifyFromJSONL(sessionId, repoPath) {
                 output: usage.output_tokens ?? 0,
               };
             }
-            break; // Only need last assistant entry per file
           } catch {
             continue;
           }
@@ -304,44 +336,104 @@ async function verifyFromJSONL(sessionId, repoPath) {
     }
 
     if (!bestTokens) {
-      hostRef.log("info", `No assistant entry found in JSONL → unknown`);
-      stats.record(sessionId, "unknown", null);
-    } else {
-      const result = bestTokens.cacheRead > bestTokens.cacheCreation ? "hit" : "miss";
-      stats.record(sessionId, result, bestTokens);
-
-      // Track consecutive misses — abort logic enforced in checkKeepalives()
-      const session = sessions.get(sessionId);
-      if (session) {
-        session.chainCacheReadTokens += bestTokens.cacheRead ?? 0;
-        if (result === "hit") {
-          session.consecutiveMisses = 0;
-        } else {
-          session.consecutiveMisses++;
-          if (session.consecutiveMisses === config.maxConsecutiveMisses) {
-            hostRef.log("info", `${session.consecutiveMisses} consecutive misses → stopping keepalives for ${sessionId.slice(0, 8)}`);
-          }
-        }
-      }
-
-      const label = result === "hit" ? "HIT" : "MISS";
-      hostRef.log(
-        "info",
-        `Cache ${label}: read=${fmtTokens(bestTokens.cacheRead)} creation=${fmtTokens(bestTokens.cacheCreation)} → ${sessionId.slice(0, 8)}`
-      );
-      hostRef.setTicker({
-        id: `${PLUGIN_ID}:status`,
-        text: `Cache ${label} (${fmtTokens(bestTokens.cacheRead)} read)`,
-        label: "Cache",
-        icon: ICON,
-        priority: result === "hit" ? 5 : 50,
-        ttlMs: 10000,
-      });
+      const label = isFollowUp ? "follow-up" : "keepalive";
+      hostRef.log("info", `No JSONL entry after sentAt+${Math.round((Date.now() - sentAtMs) / 1000)}s for ${label} → unknown`);
+      return { result: "unknown", tokens: null };
     }
+
+    const result = bestTokens.cacheRead > bestTokens.cacheCreation ? "hit" : "miss";
+    return { result, tokens: bestTokens };
   } catch (err) {
     hostRef.log("warn", `JSONL read failed for ${repoPath}: ${err}`);
-    stats.record(sessionId, "unknown", null);
+    return { result: "unknown", tokens: null };
   }
+}
+
+/**
+ * After keepalive response completes, verify cache hit/miss from JSONL.
+ * Uses the send timestamp to find the matching response, not "last entry".
+ */
+async function verifyFromJSONL(sessionId, repoPath, sentAtMs) {
+  if (!sessions.has(sessionId)) {
+    stats.record(sessionId, "unknown", null);
+    saveStats();
+    updateDashboard();
+    return;
+  }
+
+  const { result, tokens } = await readJSONLAfter(sessionId, repoPath, sentAtMs, false);
+
+  if (result === "unknown" || !tokens) {
+    stats.record(sessionId, "unknown", null);
+  } else {
+    stats.record(sessionId, result, tokens);
+
+    const session = sessions.get(sessionId);
+    if (session) {
+      session.chainCacheReadTokens += tokens.cacheRead ?? 0;
+      if (result === "hit") {
+        session.consecutiveMisses = 0;
+      } else {
+        session.consecutiveMisses++;
+        if (session.consecutiveMisses === config.maxConsecutiveMisses) {
+          hostRef.log("info", `${session.consecutiveMisses} consecutive misses → stopping keepalives for ${sessionId.slice(0, 8)}`);
+        }
+      }
+    }
+
+    const label = result === "hit" ? "HIT" : "MISS";
+    hostRef.log(
+      "info",
+      `Cache ${label}: read=${fmtTokens(tokens.cacheRead)} creation=${fmtTokens(tokens.cacheCreation)} → ${sessionId.slice(0, 8)}`
+    );
+    hostRef.setTicker({
+      id: `${PLUGIN_ID}:status`,
+      text: `Cache ${label} (${fmtTokens(tokens.cacheRead)} read)`,
+      label: "Cache",
+      icon: ICON,
+      priority: result === "hit" ? 5 : 50,
+      ttlMs: 10000,
+    });
+  }
+
+  saveStats();
+  updateDashboard();
+}
+
+/**
+ * After the user's real follow-up turn completes, verify if the cache was warm.
+ * This is the true savings signal: did the keepalive chain actually prevent a miss?
+ *
+ * @param {string} sessionId
+ * @param {string} repoPath
+ * @param {number} busyStartMs - when the user's real turn started (lastBusyAt)
+ */
+async function verifyFollowUp(sessionId, repoPath, busyStartMs) {
+  const session = sessions.get(sessionId);
+  if (!session) return;
+  session.pendingFollowUpVerify = false;
+
+  const { result, tokens } = await readJSONLAfter(sessionId, repoPath, busyStartMs, true);
+
+  if (result === "unknown") {
+    hostRef?.log("info", `Follow-up verify: no JSONL entry found → ${sessionId.slice(0, 8)}`);
+    return;
+  }
+
+  stats.recordFollowUp(result);
+  const label = result === "hit" ? "HIT" : "MISS";
+  hostRef?.log(
+    "info",
+    `Follow-up ${label}: read=${fmtTokens(tokens?.cacheRead)} → ${sessionId.slice(0, 8)} (keepalives were ${result === "hit" ? "EFFECTIVE" : "INEFFECTIVE"})`
+  );
+  hostRef?.setTicker({
+    id: `${PLUGIN_ID}:followup`,
+    text: `Return ${label} — keepalive ${result === "hit" ? "worked" : "failed"}`,
+    label: "Cache",
+    icon: ICON,
+    priority: result === "hit" ? 3 : 60,
+    ttlMs: 12000,
+  });
 
   saveStats();
   updateDashboard();
@@ -362,11 +454,11 @@ function checkKeepalives() {
     if (session.pendingKeepalive) {
       if (session.pendingKeepaliveAt > 0 && now - session.pendingKeepaliveAt > PENDING_TIMEOUT_MS) {
         hostRef.log("warn", `pendingKeepalive stuck for ${Math.round((now - session.pendingKeepaliveAt) / 1000)}s → force-clearing ${sessionId.slice(0, 8)}`);
+        const sentAt = session.lastKeepaliveSentAt || session.pendingKeepaliveAt;
         session.pendingKeepalive = false;
         session.pendingKeepaliveAt = 0;
-        stats.record(sessionId, "unknown", null);
-        saveStats();
-        updateDashboard();
+        // Still try to verify — the response may have arrived even if the idle event didn't
+        verifyFromJSONL(sessionId, session.repoPath, sentAt);
       }
       continue;
     }
@@ -392,6 +484,7 @@ function checkKeepalives() {
       const count = session.keepaliveCount;
       const max = config.maxKeepalives;
 
+      session.lastKeepaliveSentAt = now;
       hostRef.sendAgentInput(sessionId, config.message).catch((err) => {
           const msg = String(err);
           if (msg.includes("not found") || msg.includes("No such session")) {
@@ -483,39 +576,54 @@ export default {
 
     host.registerMarkdownProvider(PLUGIN_ID, {
       provideContent() {
-        const { saved, realisticSaved, cost } = stats.savings;
-        const net = saved - cost;
-        const realisticNet = realisticSaved - cost;
+        const { saved, realisticSaved, cost, lostCost } = stats.savings;
+        const net = saved - cost - lostCost;
+        const realisticNet = realisticSaved - cost - lostCost;
         const hitRate =
           stats.totalSent > 0
             ? Math.round((stats.totalHit / stats.totalSent) * 100)
             : 0;
+        const followUpTotal = stats.followUpHits + stats.followUpMisses;
+        const followUpHitRate = followUpTotal > 0
+          ? Math.round((stats.followUpHits / followUpTotal) * 100) : null;
 
         let md = "# Cache Keepalive Analytics\n\n";
 
-        md += "## Cost Impact (Opus pricing)\n\n";
+        md += "## Net Savings (Opus pricing)\n\n";
         md += "| Metric | Optimistic | Realistic |\n|--------|-----------|----------|\n";
-        md += `| Avoided cache miss savings | ${fmtDollars(saved)} | ${fmtDollars(realisticSaved)} |\n`;
-        md += `| Keepalive cost | ${fmtDollars(cost)} | ${fmtDollars(cost)} |\n`;
-        md += `| **Net savings** | **${fmtDollars(net)}** | **${fmtDollars(realisticNet)}** |\n\n`;
-        md += "*Optimistic assumes every keepalive prevented a miss. Realistic only counts chains where the user returned AFTER the cache TTL — chains resolved within the TTL are classified as wasted (cache would have stayed warm without our pings).*\n\n";
+        md += `| Avoided miss savings | ${fmtDollars(saved)} | ${fmtDollars(realisticSaved)} |\n`;
+        md += `| Keepalive overhead | -${fmtDollars(cost)} | -${fmtDollars(cost)} |\n`;
+        md += `| Lost chain cost | -${fmtDollars(lostCost)} | -${fmtDollars(lostCost)} |\n`;
+        md += `| **Net** | **${net >= 0 ? fmtDollars(net) : "-" + fmtDollars(-net)}** | **${realisticNet >= 0 ? fmtDollars(realisticNet) : "-" + fmtDollars(-realisticNet)}** |\n\n`;
+        md += "*Optimistic: every keepalive prevented a miss. Realistic: only chains where user returned AFTER cache TTL. Lost: sessions closed without return — pure cost.*\n\n";
 
-        md += "## Chain Effectiveness\n\n";
-        const chainTotal = stats.helpfulKeepalives + stats.wastedKeepalives;
+        if (followUpTotal > 0) {
+          md += "## Follow-Up Verification (ground truth)\n\n";
+          md += "After each helpful chain, the user's real next turn is checked from JSONL.\n\n";
+          md += "| Metric | Value |\n|--------|-------|\n";
+          md += `| Follow-up cache hits | ${stats.followUpHits} |\n`;
+          md += `| Follow-up cache misses | ${stats.followUpMisses} |\n`;
+          md += `| **Effective rate** | **${followUpHitRate}%** |\n\n`;
+        }
+
+        md += "## Chain Breakdown\n\n";
+        const chainTotal = stats.helpfulKeepalives + stats.wastedKeepalives + stats.lostKeepalives;
         const helpfulPct = chainTotal > 0 ? Math.round((stats.helpfulKeepalives / chainTotal) * 100) : 0;
-        md += "| Metric | Value |\n|--------|-------|\n";
-        md += `| Helpful keepalives (user returned after TTL) | ${stats.helpfulKeepalives} |\n`;
-        md += `| Wasted keepalives (user returned within TTL) | ${stats.wastedKeepalives} |\n`;
-        md += `| **Helpful rate** | **${helpfulPct}%** |\n\n`;
+        const lostPct = chainTotal > 0 ? Math.round((stats.lostKeepalives / chainTotal) * 100) : 0;
+        md += "| Category | Keepalives | % |\n|----------|-----------|---|\n";
+        md += `| Helpful (user returned after TTL) | ${stats.helpfulKeepalives} | ${helpfulPct}% |\n`;
+        md += `| Wasted (user returned within TTL) | ${stats.wastedKeepalives} | ${chainTotal > 0 ? Math.round((stats.wastedKeepalives / chainTotal) * 100) : 0}% |\n`;
+        md += `| **Lost (session closed, no return)** | **${stats.lostKeepalives}** | **${lostPct}%** |\n\n`;
 
         md += "## Token Breakdown\n\n";
         md += "| Metric | Tokens |\n|--------|--------|\n";
-        md += `| Cache read (warm) | ${fmtTokens(stats.totalCacheReadTokens)} |\n`;
-        md += `| Cache creation (cold) | ${fmtTokens(stats.totalCacheCreationTokens)} |\n`;
-        md += `| Input (new) | ${fmtTokens(stats.totalInputTokens)} |\n`;
-        md += `| Output (responses) | ${fmtTokens(stats.totalOutputTokens)} |\n`;
+        md += `| Cache read (warm hits) | ${fmtTokens(stats.totalCacheReadTokens)} |\n`;
+        md += `| Cache read from lost chains | ${fmtTokens(stats.lostCacheReadTokens)} |\n`;
+        md += `| Cache creation (cold misses) | ${fmtTokens(stats.totalCacheCreationTokens)} |\n`;
+        md += `| Input (new tokens per ping) | ${fmtTokens(stats.totalInputTokens)} |\n`;
+        md += `| Output (ping responses) | ${fmtTokens(stats.totalOutputTokens)} |\n`;
 
-        md += "\n## Effectiveness\n\n";
+        md += "\n## Ping Effectiveness\n\n";
         md += "| Metric | Value |\n|--------|-------|\n";
         md += `| Keepalives sent | ${stats.totalSent} |\n`;
         md += `| Cache hits (read > creation) | ${stats.totalHit} |\n`;
@@ -541,7 +649,7 @@ export default {
         }
 
         md += "\n---\n*Data source: Claude Code session JSONL (`~/.claude/projects/`). ";
-        md += "Verification reads `message.usage.cache_read_input_tokens` from the last assistant entry.*\n";
+        md += "Keepalive responses matched by send timestamp. Follow-up verification reads the user's real next turn.*\n";
 
         return md;
       },
@@ -581,11 +689,13 @@ export default {
 
       if (payload.state === "idle") {
         if (session.pendingKeepalive) {
-          // Idle after our keepalive response — verify and reset timer
+          // Idle after our keepalive response — verify using send timestamp and reset timer
+          const sentAt = session.lastKeepaliveSentAt || session.pendingKeepaliveAt;
           session.pendingKeepalive = false;
           session.pendingKeepaliveAt = 0;
           session.lastIdleAt = Date.now();
-          setTimeout(() => verifyFromJSONL(sessionId, session.repoPath), 2000);
+          // Delay slightly to let Claude Code finish writing the JSONL entry
+          setTimeout(() => verifyFromJSONL(sessionId, session.repoPath, sentAt), 2000);
           return;
         }
 
@@ -601,12 +711,20 @@ export default {
             // meaning without keepalives the next turn would have been a miss.
             if (session.chainStartedAt > 0 && session.keepaliveCount > 0) {
               const elapsedSinceIdle = Date.now() - session.chainStartedAt;
-              const helpful = elapsedSinceIdle > config.ttlMs;
-              stats.finalizeChain(helpful, session.keepaliveCount, session.chainCacheReadTokens);
+              const kind = elapsedSinceIdle > config.ttlMs ? "helpful" : "wasted";
+              stats.finalizeChain(kind, session.keepaliveCount, session.chainCacheReadTokens);
               hostRef.log(
                 "info",
-                `Chain finalized: ${helpful ? "HELPFUL" : "WASTED"} (${session.keepaliveCount} pings, idle ${Math.round(elapsedSinceIdle / 1000)}s) → ${sessionId.slice(0, 8)}`
+                `Chain finalized: ${kind.toUpperCase()} (${session.keepaliveCount} pings, idle ${Math.round(elapsedSinceIdle / 1000)}s) → ${sessionId.slice(0, 8)}`
               );
+              // Schedule follow-up verification: read the user's real turn JSONL
+              // after it completes to confirm whether the cache was actually warm.
+              if (kind === "helpful" && !session.pendingFollowUpVerify) {
+                session.pendingFollowUpVerify = true;
+                const busyStartMs = session.lastBusyAt;
+                // Wait for the turn to complete before reading JSONL
+                setTimeout(() => verifyFollowUp(sessionId, session.repoPath, busyStartMs), 5000);
+              }
               saveStats();
               updateDashboard();
             }
@@ -652,10 +770,19 @@ export default {
       });
     });
 
-    // Clean up tracking when a session is closed
+    // Clean up tracking when a session is closed — finalize any open chain as "lost"
     host.registerStructuredEventHandler("session-closed", (_payload, sessionId) => {
       const s = sessions.get(sessionId);
       if (s) {
+        if (s.chainStartedAt > 0 && s.keepaliveCount > 0) {
+          stats.finalizeChain("lost", s.keepaliveCount, s.chainCacheReadTokens);
+          host.log(
+            "info",
+            `Chain LOST (session closed, ${s.keepaliveCount} pings orphaned) → ${sessionId.slice(0, 8)}`
+          );
+          saveStats();
+          updateDashboard();
+        }
         host.log("info", `Session ${sessionId.slice(0, 8)} closed — removing from tracking`);
         sessions.delete(sessionId);
       }
