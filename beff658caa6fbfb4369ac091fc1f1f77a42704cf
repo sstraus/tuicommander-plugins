@@ -1,0 +1,23 @@
+cache-keepalive/main.js
+  a0acbd2e8c055785 66-69,89-90,93-98,102-107,110,112-115,119-121,154-157,166,182,184-186,243-245,255-256,258-259,268-279,281-282,286,288,292,295-296,298,304-305,309,317-319,339-341,343-345,348-357,359-396,403-420,423-437,457,460-461,487,579-581,586-588,592,594-607,609-610,612-616,620-624,626,652,692-693,697-698,714-715,718,720-727,773,777-785
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.2.8",
+  "base_commit_sha": "beff658caa6fbfb4369ac091fc1f1f77a42704cf",
+  "prompts": {
+    "a0acbd2e8c055785": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4a77729d-9139-4d59-a9ff-edf9bd77fb13",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "Stefano Straus",
+      "messages": [],
+      "total_additions": 230,
+      "total_deletions": 103,
+      "accepted_lines": 230,
+      "overriden_lines": 0
+    }
+  }
+}
