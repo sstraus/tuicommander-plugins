@@ -34,6 +34,9 @@ const DEFAULTS = {
   checkIntervalMs: 30 * 1000,
   message: "[noop] reply .",
   maxConsecutiveMisses: 2,
+  /** Absolute ceiling: total keepalives ever sent per session (never resets).
+   *  Safety net against infinite loops if JSONL verification fails. */
+  maxTotalKeepalives: 9,
 };
 
 // ── Per-session state ────────────────────────────────────────────────
@@ -67,6 +70,8 @@ class SessionTracker {
     this.lastKeepaliveSentAt = 0;
     /** True when we're waiting to read the real user follow-up turn from JSONL */
     this.pendingFollowUpVerify = false;
+    /** Total keepalives ever sent in this session — NEVER resets. Safety net. */
+    this.totalKeepalivesEver = 0;
   }
 }
 
@@ -350,6 +355,63 @@ async function readJSONLAfter(sessionId, repoPath, sentAtMs, isFollowUp = false)
 }
 
 /**
+ * Check whether the most recent human message in JSONL is a real user
+ * message (not a keepalive noop).  Used to gate keepaliveCount resets:
+ * only reset when the user genuinely interacted with the session.
+ *
+ * @param {string} repoPath
+ * @returns {Promise<boolean>} true if last human message is real (not noop)
+ */
+async function isLastHumanMessageReal(repoPath) {
+  if (!hostRef || !repoPath) return false;
+
+  try {
+    const projectDir = await hostRef.getClaudeProjectDir(repoPath);
+    if (!projectDir) return false;
+
+    const files = await hostRef.listDirectory(projectDir, "*.jsonl", { sortBy: "mtime" });
+    if (!files || files.length === 0) return false;
+
+    // Check the 3 most recently modified files (same strategy as readJSONLAfter).
+    const filesToCheck = files.slice(0, 3);
+    let bestTs = 0;
+    let bestText = null;
+
+    for (const filename of filesToCheck) {
+      try {
+        const filePath = `${projectDir}/${filename}`;
+        const tail = await hostRef.readFileTail(filePath, 8192);
+        if (!tail) continue;
+
+        const lines = tail.split("\n").filter((l) => l.trim());
+        for (let i = lines.length - 1; i >= 0; i--) {
+          try {
+            const entry = JSON.parse(lines[i]);
+            if (entry.type !== "human") continue;
+            const ts = new Date(entry.timestamp ?? 0).getTime();
+            if (ts <= bestTs) continue;
+            const content = entry.message?.content;
+            if (!content) continue;
+            bestTs = ts;
+            bestText = typeof content === "string"
+              ? content
+              : Array.isArray(content)
+                ? content.map((c) => c.text || "").join("")
+                : "";
+            break; // only need the latest human entry per file
+          } catch { continue; }
+        }
+      } catch { continue; }
+    }
+
+    if (bestText === null) return false;
+    return !bestText.includes(config.message);
+  } catch {
+    return false;
+  }
+}
+
+/**
  * After keepalive response completes, verify cache hit/miss from JSONL.
  * Uses the send timestamp to find the matching response, not "last entry".
  */
@@ -464,12 +526,14 @@ function checkKeepalives() {
     }
     if (session.rateLimitedUntilMs !== null && now < session.rateLimitedUntilMs) continue;
     if (session.consecutiveMisses >= config.maxConsecutiveMisses) continue;
+    if (session.totalKeepalivesEver >= config.maxTotalKeepalives) continue;
 
     const idleMs = now - session.lastIdleAt;
     if (idleMs >= interval) {
       session.pendingKeepalive = true;
       session.pendingKeepaliveAt = now;
       session.keepaliveCount++;
+      session.totalKeepalivesEver++;
       if (session.chainStartedAt === 0) {
         session.chainStartedAt = session.lastIdleAt;
         session.chainCacheReadTokens = 0;
@@ -495,6 +559,7 @@ function checkKeepalives() {
             session.pendingKeepalive = false;
             session.pendingKeepaliveAt = 0;
             session.keepaliveCount--;
+            session.totalKeepalivesEver--;
           }
         });
 
@@ -706,33 +771,57 @@ export default {
             ? Date.now() - session.lastBusyAt
             : 0;
           if (busyDuration >= MIN_BUSY_DURATION_MS) {
-            // Real user activity — finalize the chain for realistic-savings tracking.
-            // A chain is "helpful" if the user came back AFTER the cache TTL,
-            // meaning without keepalives the next turn would have been a miss.
-            if (session.chainStartedAt > 0 && session.keepaliveCount > 0) {
-              const elapsedSinceIdle = Date.now() - session.chainStartedAt;
-              const kind = elapsedSinceIdle > config.ttlMs ? "helpful" : "wasted";
-              stats.finalizeChain(kind, session.keepaliveCount, session.chainCacheReadTokens);
-              hostRef.log(
-                "info",
-                `Chain finalized: ${kind.toUpperCase()} (${session.keepaliveCount} pings, idle ${Math.round(elapsedSinceIdle / 1000)}s) → ${sessionId.slice(0, 8)}`
-              );
-              // Schedule follow-up verification: read the user's real turn JSONL
-              // after it completes to confirm whether the cache was actually warm.
-              if (kind === "helpful" && !session.pendingFollowUpVerify) {
-                session.pendingFollowUpVerify = true;
-                const busyStartMs = session.lastBusyAt;
-                // Wait for the turn to complete before reading JSONL
-                setTimeout(() => verifyFollowUp(sessionId, session.repoPath, busyStartMs), 5000);
-              }
-              saveStats();
-              updateDashboard();
+            // Resolve repo path early — needed for JSONL verification.
+            if (!session.repoPath) {
+              session.repoPath = hostRef.getRepoPathForSession(sessionId);
             }
-            session.keepaliveCount = 0;
-            session.consecutiveMisses = 0;
-            session.chainStartedAt = 0;
-            session.chainCacheReadTokens = 0;
-            session.lastIdleAt = Date.now();
+
+            // If keepalives were sent, verify via JSONL that the activity
+            // is a real user message (not a phantom busy→idle or noop
+            // aftermath) before resetting the counter.
+            if (session.keepaliveCount > 0) {
+              const capturedCount = session.keepaliveCount;
+              const capturedChainStart = session.chainStartedAt;
+              const capturedChainTokens = session.chainCacheReadTokens;
+              const capturedBusyAt = session.lastBusyAt;
+
+              isLastHumanMessageReal(session.repoPath).then((isReal) => {
+                const s = sessions.get(sessionId);
+                if (!s) return;
+
+                if (isReal) {
+                  // Real user activity — finalize chain and reset.
+                  if (capturedChainStart > 0) {
+                    const elapsedSinceIdle = Date.now() - capturedChainStart;
+                    const kind = elapsedSinceIdle > config.ttlMs ? "helpful" : "wasted";
+                    stats.finalizeChain(kind, capturedCount, capturedChainTokens);
+                    hostRef?.log(
+                      "info",
+                      `Chain finalized: ${kind.toUpperCase()} (${capturedCount} pings, idle ${Math.round(elapsedSinceIdle / 1000)}s) → ${sessionId.slice(0, 8)}`
+                    );
+                    if (kind === "helpful" && !s.pendingFollowUpVerify) {
+                      s.pendingFollowUpVerify = true;
+                      setTimeout(() => verifyFollowUp(sessionId, s.repoPath, capturedBusyAt), 5000);
+                    }
+                    saveStats();
+                    updateDashboard();
+                  }
+                  s.keepaliveCount = 0;
+                  s.consecutiveMisses = 0;
+                  s.chainStartedAt = 0;
+                  s.chainCacheReadTokens = 0;
+                  s.totalKeepalivesEver = 0;
+                  s.lastIdleAt = Date.now();
+                  hostRef?.log("info", `Real user message in JSONL → counter reset (including safety net) for ${sessionId.slice(0, 8)}`);
+                } else {
+                  // Not real user activity — keep counter, don't restart keepalives.
+                  hostRef?.log("info", `No real user message in JSONL → counter stays at ${s.keepaliveCount}/${config.maxKeepalives} for ${sessionId.slice(0, 8)}`);
+                }
+              });
+            } else {
+              // No keepalives were active — just reset idle timer.
+              session.lastIdleAt = Date.now();
+            }
           }
           // Short busy: don't touch lastIdleAt or count — timer continues
           return;
