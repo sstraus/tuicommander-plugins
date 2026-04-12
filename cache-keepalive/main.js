@@ -355,60 +355,36 @@ async function readJSONLAfter(sessionId, repoPath, sentAtMs, isFollowUp = false)
 }
 
 /**
- * Check whether the most recent human message in JSONL is a real user
- * message (not a keepalive noop).  Used to gate keepaliveCount resets:
- * only reset when the user genuinely interacted with the session.
- *
- * @param {string} repoPath
- * @returns {Promise<boolean>} true if last human message is real (not noop)
+ * Reset keepalive counters for a session after confirmed real user activity.
+ * Finalizes the current chain for stats tracking.
  */
-async function isLastHumanMessageReal(repoPath) {
-  if (!hostRef || !repoPath) return false;
+function resetOnRealUserInput(sessionId) {
+  const s = sessions.get(sessionId);
+  if (!s || s.keepaliveCount === 0) return;
 
-  try {
-    const projectDir = await hostRef.getClaudeProjectDir(repoPath);
-    if (!projectDir) return false;
-
-    const files = await hostRef.listDirectory(projectDir, "*.jsonl", { sortBy: "mtime" });
-    if (!files || files.length === 0) return false;
-
-    // Check the 3 most recently modified files (same strategy as readJSONLAfter).
-    const filesToCheck = files.slice(0, 3);
-    let bestTs = 0;
-    let bestText = null;
-
-    for (const filename of filesToCheck) {
-      try {
-        const filePath = `${projectDir}/${filename}`;
-        const tail = await hostRef.readFileTail(filePath, 8192);
-        if (!tail) continue;
-
-        const lines = tail.split("\n").filter((l) => l.trim());
-        for (let i = lines.length - 1; i >= 0; i--) {
-          try {
-            const entry = JSON.parse(lines[i]);
-            if (entry.type !== "human") continue;
-            const ts = new Date(entry.timestamp ?? 0).getTime();
-            if (ts <= bestTs) continue;
-            const content = entry.message?.content;
-            if (!content) continue;
-            bestTs = ts;
-            bestText = typeof content === "string"
-              ? content
-              : Array.isArray(content)
-                ? content.map((c) => c.text || "").join("")
-                : "";
-            break; // only need the latest human entry per file
-          } catch { continue; }
-        }
-      } catch { continue; }
+  if (s.chainStartedAt > 0) {
+    const elapsedSinceIdle = Date.now() - s.chainStartedAt;
+    const kind = elapsedSinceIdle > config.ttlMs ? "helpful" : "wasted";
+    stats.finalizeChain(kind, s.keepaliveCount, s.chainCacheReadTokens);
+    hostRef?.log(
+      "info",
+      `Chain finalized: ${kind.toUpperCase()} (${s.keepaliveCount} pings, idle ${Math.round(elapsedSinceIdle / 1000)}s) → ${sessionId.slice(0, 8)}`
+    );
+    if (kind === "helpful" && !s.pendingFollowUpVerify) {
+      s.pendingFollowUpVerify = true;
+      const busyStartMs = s.lastBusyAt;
+      setTimeout(() => verifyFollowUp(sessionId, s.repoPath, busyStartMs), 5000);
     }
-
-    if (bestText === null) return false;
-    return !bestText.includes(config.message);
-  } catch {
-    return false;
+    saveStats();
+    updateDashboard();
   }
+  s.keepaliveCount = 0;
+  s.consecutiveMisses = 0;
+  s.chainStartedAt = 0;
+  s.chainCacheReadTokens = 0;
+  s.totalKeepalivesEver = 0;
+  s.lastIdleAt = Date.now();
+  hostRef?.log("info", `Real user input → counter reset for ${sessionId.slice(0, 8)}`);
 }
 
 /**
@@ -771,57 +747,11 @@ export default {
             ? Date.now() - session.lastBusyAt
             : 0;
           if (busyDuration >= MIN_BUSY_DURATION_MS) {
-            // Resolve repo path early — needed for JSONL verification.
-            if (!session.repoPath) {
-              session.repoPath = hostRef.getRepoPathForSession(sessionId);
-            }
-
-            // If keepalives were sent, verify via JSONL that the activity
-            // is a real user message (not a phantom busy→idle or noop
-            // aftermath) before resetting the counter.
-            if (session.keepaliveCount > 0) {
-              const capturedCount = session.keepaliveCount;
-              const capturedChainStart = session.chainStartedAt;
-              const capturedChainTokens = session.chainCacheReadTokens;
-              const capturedBusyAt = session.lastBusyAt;
-
-              isLastHumanMessageReal(session.repoPath).then((isReal) => {
-                const s = sessions.get(sessionId);
-                if (!s) return;
-
-                if (isReal) {
-                  // Real user activity — finalize chain and reset.
-                  if (capturedChainStart > 0) {
-                    const elapsedSinceIdle = Date.now() - capturedChainStart;
-                    const kind = elapsedSinceIdle > config.ttlMs ? "helpful" : "wasted";
-                    stats.finalizeChain(kind, capturedCount, capturedChainTokens);
-                    hostRef?.log(
-                      "info",
-                      `Chain finalized: ${kind.toUpperCase()} (${capturedCount} pings, idle ${Math.round(elapsedSinceIdle / 1000)}s) → ${sessionId.slice(0, 8)}`
-                    );
-                    if (kind === "helpful" && !s.pendingFollowUpVerify) {
-                      s.pendingFollowUpVerify = true;
-                      setTimeout(() => verifyFollowUp(sessionId, s.repoPath, capturedBusyAt), 5000);
-                    }
-                    saveStats();
-                    updateDashboard();
-                  }
-                  s.keepaliveCount = 0;
-                  s.consecutiveMisses = 0;
-                  s.chainStartedAt = 0;
-                  s.chainCacheReadTokens = 0;
-                  s.totalKeepalivesEver = 0;
-                  s.lastIdleAt = Date.now();
-                  hostRef?.log("info", `Real user message in JSONL → counter reset (including safety net) for ${sessionId.slice(0, 8)}`);
-                } else {
-                  // Not real user activity — keep counter, don't restart keepalives.
-                  hostRef?.log("info", `No real user message in JSONL → counter stays at ${s.keepaliveCount}/${config.maxKeepalives} for ${sessionId.slice(0, 8)}`);
-                }
-              });
-            } else {
-              // No keepalives were active — just reset idle timer.
-              session.lastIdleAt = Date.now();
-            }
+            // Don't reset keepaliveCount here — that's handled exclusively
+            // by the "user-input" structured event, which only fires on
+            // real user messages (never on keepalive noop responses).
+            // Just reset the idle timer for the next keepalive interval.
+            session.lastIdleAt = Date.now();
           }
           // Short busy: don't touch lastIdleAt or count — timer continues
           return;
@@ -833,6 +763,16 @@ export default {
           session.lastIdleAt = Date.now();
         }
       }
+    });
+
+    // ── Real user input — reset keepalive counter ─────────────────
+    // Fired by the Rust PTY layer when a complete line is submitted via
+    // write_pty (both GUI typing AND plugin sendAgentInput go through
+    // this path). Filter out our own keepalive noop messages.
+    host.registerStructuredEventHandler("user-input", (payload, sessionId) => {
+      const content = payload?.content ?? "";
+      if (content.includes(config.message)) return; // our own noop — ignore
+      resetOnRealUserInput(sessionId);
     });
 
     // ── Usage exhaustion — stop keepalives, schedule auto-resume ───
