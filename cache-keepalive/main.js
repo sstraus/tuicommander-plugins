@@ -76,7 +76,15 @@ class SessionTracker {
     this.detectedTtlMs = null;
     /** Probe in-flight flag to avoid duplicate JSONL reads */
     this.probingTtl = false;
+    /** True once we confirm the Claude project dir doesn't exist for this repo — stop probing JSONL. */
+    this.noClaudeJsonl = false;
   }
+}
+
+/** Returns true if `err` is an ENOENT-style missing-path error from host path APIs. */
+function isMissingPathError(err) {
+  const msg = String(err ?? "");
+  return msg.includes("No such file or directory") || msg.includes("Failed to resolve path");
 }
 
 /** Infer cache TTL from a Claude API usage object. Returns ms or null if inconclusive. */
@@ -312,9 +320,23 @@ function updateDashboard() {
  */
 async function readJSONLAfter(sessionId, repoPath, sentAtMs, isFollowUp = false) {
   if (!hostRef || !repoPath) return { result: "unknown", tokens: null };
+  const session = sessions.get(sessionId);
+  if (session?.noClaudeJsonl) return { result: "unknown", tokens: null };
 
   try {
-    const projectDir = await hostRef.getClaudeProjectDir(repoPath);
+    let projectDir;
+    try {
+      projectDir = await hostRef.getClaudeProjectDir(repoPath);
+    } catch (err) {
+      if (isMissingPathError(err)) {
+        if (session && !session.noClaudeJsonl) {
+          session.noClaudeJsonl = true;
+          hostRef.log("info", `No Claude project dir for ${repoPath} — disabling JSONL verification for ${sessionId.slice(0, 8)}`);
+        }
+        return { result: "unknown", tokens: null };
+      }
+      throw err;
+    }
     if (!projectDir) return { result: "unknown", tokens: null };
 
     // Sort by mtime: active session file has the most recent write.
@@ -433,7 +455,7 @@ function applyDetectedTtl(session, sessionId, tokens) {
  */
 async function probeCacheTtl(sessionId) {
   const session = sessions.get(sessionId);
-  if (!session || session.detectedTtlMs !== null || session.probingTtl) return;
+  if (!session || session.detectedTtlMs !== null || session.probingTtl || session.noClaudeJsonl) return;
   if (!hostRef) return;
   if (!session.repoPath) {
     session.repoPath = hostRef.getRepoPathForSession(sessionId);
@@ -441,7 +463,17 @@ async function probeCacheTtl(sessionId) {
   if (!session.repoPath) return;
   session.probingTtl = true;
   try {
-    const projectDir = await hostRef.getClaudeProjectDir(session.repoPath);
+    let projectDir;
+    try {
+      projectDir = await hostRef.getClaudeProjectDir(session.repoPath);
+    } catch (err) {
+      if (isMissingPathError(err)) {
+        session.noClaudeJsonl = true;
+        hostRef.log("info", `No Claude project dir for ${session.repoPath} — disabling JSONL verification for ${sessionId.slice(0, 8)}`);
+        return;
+      }
+      throw err;
+    }
     if (!projectDir) return;
     const files = await hostRef.listDirectory(projectDir, "*.jsonl", { sortBy: "mtime" });
     if (!files || files.length === 0) return;
