@@ -72,7 +72,34 @@ class SessionTracker {
     this.pendingFollowUpVerify = false;
     /** Total keepalives ever sent in this session — NEVER resets. Safety net. */
     this.totalKeepalivesEver = 0;
+    /** Detected cache TTL in ms (300_000 = 5m, 3_600_000 = 1h). null = not yet known. */
+    this.detectedTtlMs = null;
+    /** Probe in-flight flag to avoid duplicate JSONL reads */
+    this.probingTtl = false;
   }
+}
+
+/** Infer cache TTL from a Claude API usage object. Returns ms or null if inconclusive. */
+function detectTtlFromUsage(usage) {
+  if (!usage) return null;
+  const cc = usage.cache_creation;
+  if (!cc || typeof cc !== "object") return null;
+  const e1h = cc.ephemeral_1h_input_tokens ?? 0;
+  const e5m = cc.ephemeral_5m_input_tokens ?? 0;
+  if (e1h > 0 && e1h >= e5m) return 60 * 60 * 1000;
+  if (e5m > 0) return 5 * 60 * 1000;
+  return null;
+}
+
+/** Effective TTL for a session: detected value if available, else configured default. */
+function effectiveTtlMs(session) {
+  return session?.detectedTtlMs ?? config.ttlMs;
+}
+
+/** Proportional margin: 30s floor, up to 2% of TTL (1h → 72s, 5m → 30s). */
+function effectiveMarginMs(session) {
+  const ttl = effectiveTtlMs(session);
+  return Math.max(config.marginMs, Math.round(ttl * 0.02));
 }
 
 // ── Cumulative stats (persisted across reloads) ──────────────────────
@@ -328,6 +355,9 @@ async function readJSONLAfter(sessionId, repoPath, sentAtMs, isFollowUp = false)
                 cacheCreation: usage.cache_creation_input_tokens ?? 0,
                 input: usage.input_tokens ?? 0,
                 output: usage.output_tokens ?? 0,
+                ephemeral1h: usage.cache_creation?.ephemeral_1h_input_tokens ?? 0,
+                ephemeral5m: usage.cache_creation?.ephemeral_5m_input_tokens ?? 0,
+                detectedTtlMs: detectTtlFromUsage(usage),
               };
             }
           } catch {
@@ -387,6 +417,59 @@ function resetOnRealUserInput(sessionId) {
   hostRef?.log("info", `Real user input → counter reset for ${sessionId.slice(0, 8)}`);
 }
 
+/** Update session.detectedTtlMs from an observed usage block. Logs on change. */
+function applyDetectedTtl(session, sessionId, tokens) {
+  if (!session || !tokens) return;
+  const detected = tokens.detectedTtlMs;
+  if (!detected || session.detectedTtlMs === detected) return;
+  session.detectedTtlMs = detected;
+  const label = detected === 60 * 60 * 1000 ? "1h" : "5m";
+  hostRef?.log("info", `Detected ${label} cache TTL → ${sessionId.slice(0, 8)} (interval now ~${Math.round((detected - effectiveMarginMs(session)) / 60000)}min)`);
+}
+
+/**
+ * Probe the most recent assistant entry in the session JSONL to detect TTL
+ * BEFORE sending any keepalive. Avoids one wasted ping on 1h sessions.
+ */
+async function probeCacheTtl(sessionId) {
+  const session = sessions.get(sessionId);
+  if (!session || session.detectedTtlMs !== null || session.probingTtl) return;
+  if (!hostRef) return;
+  if (!session.repoPath) {
+    session.repoPath = hostRef.getRepoPathForSession(sessionId);
+  }
+  if (!session.repoPath) return;
+  session.probingTtl = true;
+  try {
+    const projectDir = await hostRef.getClaudeProjectDir(session.repoPath);
+    if (!projectDir) return;
+    const files = await hostRef.listDirectory(projectDir, "*.jsonl", { sortBy: "mtime" });
+    if (!files || files.length === 0) return;
+    for (const filename of files.slice(0, 3)) {
+      const tail = await hostRef.readFileTail(`${projectDir}/${filename}`, 16384);
+      if (!tail) continue;
+      const lines = tail.split("\n").filter((l) => l.trim());
+      for (let i = lines.length - 1; i >= 0; i--) {
+        try {
+          const entry = JSON.parse(lines[i]);
+          if (entry.type !== "assistant") continue;
+          const detected = detectTtlFromUsage(entry.message?.usage);
+          if (detected) {
+            applyDetectedTtl(session, sessionId, { detectedTtlMs: detected });
+            return;
+          }
+        } catch {
+          continue;
+        }
+      }
+    }
+  } catch (err) {
+    hostRef.log("warn", `TTL probe failed for ${sessionId.slice(0, 8)}: ${err}`);
+  } finally {
+    session.probingTtl = false;
+  }
+}
+
 /**
  * After keepalive response completes, verify cache hit/miss from JSONL.
  * Uses the send timestamp to find the matching response, not "last entry".
@@ -409,6 +492,7 @@ async function verifyFromJSONL(sessionId, repoPath, sentAtMs) {
     const session = sessions.get(sessionId);
     if (session) {
       session.chainCacheReadTokens += tokens.cacheRead ?? 0;
+      applyDetectedTtl(session, sessionId, tokens);
       if (result === "hit") {
         session.consecutiveMisses = 0;
       } else {
@@ -458,6 +542,7 @@ async function verifyFollowUp(sessionId, repoPath, busyStartMs) {
     return;
   }
 
+  applyDetectedTtl(session, sessionId, tokens);
   stats.recordFollowUp(result);
   const label = result === "hit" ? "HIT" : "MISS";
   hostRef?.log(
@@ -482,11 +567,11 @@ async function verifyFollowUp(sessionId, repoPath, busyStartMs) {
 function checkKeepalives() {
   if (!hostRef) return;
   const now = Date.now();
-  const interval = config.ttlMs - config.marginMs;
   let activeCount = 0;
 
   for (const [sessionId, session] of sessions) {
     if (session.shellState !== "idle") continue;
+    const interval = effectiveTtlMs(session) - effectiveMarginMs(session);
     if (session.keepaliveCount >= config.maxKeepalives) continue;
     if (session.lastIdleAt === 0) continue;
     if (session.pendingKeepalive) {
@@ -674,10 +759,22 @@ export default {
 
         md += "\n## Configuration\n\n";
         md += "| Setting | Value |\n|---------|-------|\n";
-        md += `| Cache TTL | ${config.ttlMs / 1000}s |\n`;
+        md += `| Default cache TTL | ${config.ttlMs / 1000}s |\n`;
         md += `| Send margin | ${config.marginMs / 1000}s before expiry |\n`;
         md += `| Max per pause | ${config.maxKeepalives} |\n`;
         md += `| Message | \`${config.message}\` |\n`;
+
+        if (sessions.size > 0) {
+          md += "\n## Active Sessions — Detected TTL\n\n";
+          md += "| Session | Detected TTL | Effective interval |\n";
+          md += "|---------|--------------|-------------------|\n";
+          for (const [sid, s] of sessions) {
+            const ttl = s.detectedTtlMs;
+            const label = ttl === 3_600_000 ? "1h" : ttl === 300_000 ? "5m" : "unknown (using default)";
+            const intervalMin = Math.round((effectiveTtlMs(s) - effectiveMarginMs(s)) / 60000);
+            md += `| ${sid.slice(0, 8)} | ${label} | ~${intervalMin}min |\n`;
+          }
+        }
 
         if (stats.history.length > 0) {
           md += "\n## Recent History\n\n";
@@ -704,6 +801,7 @@ export default {
           session.lastIdleAt = Date.now();
         }
         host.log("info", `Agent started in ${event.sessionId.slice(0, 8)} — tracking`);
+        probeCacheTtl(event.sessionId);
       }
       if (event.type === "agent-stopped" && event.sessionId) {
         sessions.delete(event.sessionId);
@@ -729,6 +827,9 @@ export default {
       }
 
       if (payload.state === "idle") {
+        if (session.detectedTtlMs === null) {
+          probeCacheTtl(sessionId);
+        }
         if (session.pendingKeepalive) {
           // Idle after our keepalive response — verify using send timestamp and reset timer
           const sentAt = session.lastKeepaliveSentAt || session.pendingKeepaliveAt;
