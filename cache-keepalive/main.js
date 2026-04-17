@@ -32,7 +32,7 @@ const DEFAULTS = {
   marginMs: 30 * 1000,
   maxKeepalives: 3,
   checkIntervalMs: 30 * 1000,
-  message: "[noop] reply .",
+  message: "[noop]",
   maxConsecutiveMisses: 2,
   /** Absolute ceiling: total keepalives ever sent per session (never resets).
    *  Safety net against infinite loops if JSONL verification fails. */
