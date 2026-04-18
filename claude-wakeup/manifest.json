@@ -1,0 +1,11 @@
+{
+  "id": "claude-wakeup",
+  "name": "Claude Wakeup",
+  "version": "1.0.0",
+  "minAppVersion": "0.9.8",
+  "main": "main.js",
+  "description": "Wakes Claude Code when it stops without asking a question. Sends a verification prompt after 20s of idle-without-question; accepts `done` as completion signal.",
+  "author": "TUICommander",
+  "capabilities": ["pty:write", "pty:read", "ui:ticker", "ui:markdown"],
+  "agentTypes": ["claude"]
+}
