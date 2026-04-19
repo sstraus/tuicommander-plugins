@@ -4,8 +4,14 @@
  * Wakes Claude Code when it stops producing output without asking a question
  * — i.e. "chrome without question". After 20s of idle with no pending
  * question, no active sub-tasks, and no choice prompt, sends a verification
- * message. If the agent replies `done`, disarms until the next real user
- * turn. Otherwise re-pings up to 3 times.
+ * message. If the agent replies briefly (short busy cycle), assumes "done"
+ * and disarms until the next real user turn. Otherwise re-pings up to 3 times.
+ *
+ * "Done" detection strategy: after sending a wake, we watch the busy→idle
+ * transition. A short busy cycle (<8s) means the agent just acknowledged
+ * (e.g. replied "done"). A long busy cycle (>10s) means it continued working.
+ * OutputWatcher is kept as a bonus fast-path for agents that produce a clean
+ * "done" line, but the primary signal is the busy duration.
  */
 
 const PLUGIN_ID = "claude-wakeup";
@@ -14,25 +20,18 @@ const SECTION_ID = "claude-wakeup";
 const ICON = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="currentColor"><path d="M8 1a7 7 0 1 0 0 14A7 7 0 0 0 8 1zm1 10.5a1 1 0 1 1-2 0 1 1 0 0 1 2 0zM7 4a1 1 0 0 1 2 0v4a1 1 0 0 1-2 0V4z"/></svg>';
 
 const WAKE_MESSAGE =
-  "Verify all pending tasks are done. Reply exactly `done` if truly finished, otherwise continue";
+  "Continue, or reply `done` if finished.";
 
 const DEFAULTS = {
-  /** Idle time before the first wake ping. */
   idleThresholdMs: 20 * 1000,
-  /** Delay after sending a ping before we verify the agent's reply. */
-  verifyDelayMs: 8 * 1000,
-  /** Maximum pings per stall stretch. After this, we wait for a real user turn. */
   maxWakes: 3,
-  /** Safety ceiling across stalls in a single session. Never resets. */
   maxWakesEver: 12,
-  /** Scheduler tick. */
   checkIntervalMs: 5 * 1000,
-  /** Minimum busy duration to count as real agent activity (ms). */
   minBusyDurationMs: 1500,
-  /** Question event is considered stale after this age (ms). */
   questionStaleMs: 30 * 60 * 1000,
-  /** Pending-ping watchdog. If verify doesn't clear it, force-clear. */
   pendingTimeoutMs: 60 * 1000,
+  /** Busy cycle shorter than this after a wake = agent acknowledged ("done"). */
+  doneMaxBusyMs: 8 * 1000,
 };
 
 // ── Per-session state ────────────────────────────────────────────────
@@ -47,11 +46,13 @@ class SessionTracker {
     this.activeSubtasks = 0;
     this.choicePromptActive = false;
     this.disarmed = false;
+    this.disarmedAt = 0;
     this.wakeCount = 0;
     this.totalWakesEver = 0;
     this.pendingWake = false;
     this.pendingWakeAt = 0;
     this.lastWakeSentAt = 0;
+    this.wakeBusySeen = false;
   }
 }
 
@@ -100,15 +101,6 @@ let hostRef = null;
 let config = { ...DEFAULTS };
 let stats = new Stats();
 
-function getSession(sessionId) {
-  let s = sessions.get(sessionId);
-  if (!s) {
-    s = new SessionTracker();
-    sessions.set(sessionId, s);
-  }
-  return s;
-}
-
 function saveStats() {
   if (!hostRef) return;
   hostRef
@@ -128,55 +120,14 @@ function updateDashboard() {
   hostRef.updateItem(`${PLUGIN_ID}:dashboard`, { subtitle: parts.join(" · ") });
 }
 
-// ── Output parsing ───────────────────────────────────────────────────
+// ── Output matching (secondary fast-path) ────────────────────────────
 
-/** Regex for the `done` reply. Permissive: accepts punctuation and common prefixes. */
-const DONE_RE = /^[\s\-*>⏺·•]*done[.!?"'`]*\s*$/i;
-
-/** Rows that are decorative chrome rather than real assistant text. */
-function isChromeRow(text) {
-  if (!text) return true;
-  const t = text.trim();
-  if (!t) return true;
-  // Box-drawing / rounded-frame chars used by Claude Code's input widget
-  if (/^[\s─│┌┐└┘├┤┬┴┼╭╮╯╰═║╔╗╚╝╠╣╦╩╬]+$/.test(t)) return true;
-  // Prompt lines (> or ❯ leading)
-  if (/^[│╭╰]?\s*[>❯›]\s/.test(t)) return true;
-  if (t === ">" || t === "❯") return true;
-  // Status lines: start with ? or ⏵ or use known footer tokens
-  if (/^[?⏵⏺]/.test(t) && t.length < 3) return true;
-  // Mode-line (CC shows hints like "shift+tab to cycle modes")
-  if (/shift\+tab|esc to interrupt|tokens left|[\u2500-\u257F]/.test(t) && t.length < 80) {
-    // Only strip if it looks like a footer hint (short, has box-drawing or known tokens)
-    if (/^\s*[\u2500-\u257F]/.test(t) || /⏵⏵/.test(t)) return true;
-  }
-  return false;
-}
-
-/**
- * Scan PTY output from the bottom up to find the last line that looks like
- * an assistant reply (non-chrome, non-prompt, not our own wake message).
- * Returns the matched line or null.
- */
-function extractLastAssistantLine(output) {
-  if (!output) return null;
-  const lines = output.split("\n");
-  for (let i = lines.length - 1; i >= 0; i--) {
-    const raw = lines[i];
-    const trimmed = raw.trim();
-    if (!trimmed) continue;
-    if (isChromeRow(trimmed)) continue;
-    if (trimmed.includes(WAKE_MESSAGE)) continue;
-    // Strip leading assistant bullet "⏺ " if present
-    const cleaned = trimmed.replace(/^[⏺·•]\s+/, "");
-    return cleaned;
-  }
-  return null;
-}
+const DONE_RE = /^[\s\-*>⏺·•]*done[.!?"'`,:;]*\s*$/i;
 
 function isDoneReply(line) {
-  if (!line) return false;
-  return DONE_RE.test(line.trim());
+  if (line.includes(WAKE_MESSAGE)) return false;
+  if (line.includes("Continue") && line.includes("finished")) return false;
+  return DONE_RE.test(line);
 }
 
 // ── Wakeup check ─────────────────────────────────────────────────────
@@ -192,6 +143,9 @@ function canWake(session, now) {
   if (session.hasQuestionAt > 0 && now - session.hasQuestionAt < config.questionStaleMs) {
     return false;
   }
+  if (session.lastUserInputAt > 0 && now - session.lastUserInputAt < config.idleThresholdMs * 2) {
+    return false;
+  }
   if (session.lastIdleAt === 0) return false;
   if (now - session.lastIdleAt < config.idleThresholdMs) return false;
   return true;
@@ -202,7 +156,6 @@ function checkWakeups() {
   const now = Date.now();
 
   for (const [sessionId, session] of sessions) {
-    // Watchdog: stuck pendingWake → force-clear
     if (
       session.pendingWake &&
       session.pendingWakeAt > 0 &&
@@ -210,10 +163,9 @@ function checkWakeups() {
     ) {
       hostRef.log(
         "warn",
-        `pendingWake stuck ${Math.round((now - session.pendingWakeAt) / 1000)}s → clearing ${sessionId.slice(0, 8)}`
+        `pendingWake stuck ${Math.round((now - session.pendingWakeAt) / 1000)}s → expiring ${sessionId.slice(0, 8)}`
       );
-      session.pendingWake = false;
-      session.pendingWakeAt = 0;
+      expirePendingWake(sessionId);
     }
 
     if (!canWake(session, now)) continue;
@@ -221,6 +173,7 @@ function checkWakeups() {
     session.pendingWake = true;
     session.pendingWakeAt = now;
     session.lastWakeSentAt = now;
+    session.wakeBusySeen = false;
     session.wakeCount++;
     session.totalWakesEver++;
 
@@ -248,66 +201,55 @@ function checkWakeups() {
         hostRef.log("error", `Wake send failed: ${err}`);
         session.pendingWake = false;
         session.pendingWakeAt = 0;
+        session.wakeBusySeen = false;
         session.wakeCount--;
         session.totalWakesEver--;
       });
-
-    setTimeout(() => verifyReply(sessionId), config.verifyDelayMs);
   }
 }
 
-/**
- * Verify the agent's reply to our wake message. Reads the PTY, scans the
- * last assistant line, and decides: `done` → disarm, otherwise reset idle
- * timer so the next tick can re-ping.
- */
-async function verifyReply(sessionId) {
+function confirmDone(sessionId, reason) {
   const session = sessions.get(sessionId);
   if (!session || !hostRef) return;
 
-  let output = null;
-  try {
-    output = await hostRef.readSessionOutput(sessionId, 80);
-  } catch (err) {
-    const msg = String(err);
-    if (msg.includes("not found") || msg.includes("Session not found")) {
-      sessions.delete(sessionId);
-      return;
-    }
-    hostRef.log("warn", `readSessionOutput failed for ${sessionId.slice(0, 8)}: ${err}`);
-  }
+  session.pendingWake = false;
+  session.pendingWakeAt = 0;
+  session.wakeBusySeen = false;
+  session.lastIdleAt = Date.now();
 
-  const lastLine = extractLastAssistantLine(output);
-  const done = isDoneReply(lastLine);
+  stats.record(sessionId, "done");
+  session.disarmed = true;
+  session.disarmedAt = Date.now();
+  session.wakeCount = 0;
+  hostRef.log(
+    "info",
+    `Wakeup confirmed DONE (${reason}) → ${sessionId.slice(0, 8)} (disarmed until next user turn)`
+  );
+  hostRef.setTicker({
+    id: `${PLUGIN_ID}:status`,
+    text: "Agent confirmed done",
+    label: "Wakeup",
+    icon: ICON,
+    priority: 5,
+    ttlMs: 8000,
+  });
+
+  saveStats();
+  updateDashboard();
+}
+
+function expirePendingWake(sessionId) {
+  const session = sessions.get(sessionId);
+  if (!session || !hostRef) return;
+  if (!session.pendingWake) return;
 
   session.pendingWake = false;
   session.pendingWakeAt = 0;
-  // Reset idle timer so further waking has to wait another threshold.
+  session.wakeBusySeen = false;
   session.lastIdleAt = Date.now();
 
-  if (done) {
-    stats.record(sessionId, "done");
-    session.disarmed = true;
-    session.wakeCount = 0;
-    hostRef.log(
-      "info",
-      `Wakeup confirmed DONE → ${sessionId.slice(0, 8)} (disarmed until next user turn)`
-    );
-    hostRef.setTicker({
-      id: `${PLUGIN_ID}:status`,
-      text: "Agent confirmed done",
-      label: "Wakeup",
-      icon: ICON,
-      priority: 5,
-      ttlMs: 8000,
-    });
-  } else {
-    stats.record(sessionId, "no-reply");
-    hostRef.log(
-      "info",
-      `Wakeup reply='${lastLine ?? "(none)"}' — not done, will retry ${sessionId.slice(0, 8)}`
-    );
-  }
+  stats.record(sessionId, "no-reply");
+  hostRef.log("info", `Wakeup no done reply within timeout → ${sessionId.slice(0, 8)}, will retry`);
 
   saveStats();
   updateDashboard();
@@ -353,6 +295,23 @@ export default {
       canDismissAll: false,
     });
 
+    // OutputWatcher: secondary fast-path for "done" detection.
+    // Primary detection is via busy-cycle duration in the shell-state handler.
+    // This catches cases where the agent emits a clean "done" line before
+    // the busy→idle transition is processed.
+    host.registerOutputWatcher({
+      pattern: /done/i,
+      onMatch(match, sessionId) {
+        const session = sessions.get(sessionId);
+        if (!session?.pendingWake) return;
+        const fullLine = match.input ?? "";
+        if (isDoneReply(fullLine)) {
+          host.log("info", `OutputWatcher fast-path: "${fullLine}"`);
+          confirmDone(sessionId, "output-watcher");
+        }
+      },
+    });
+
     host.addItem({
       id: `${PLUGIN_ID}:dashboard`,
       pluginId: PLUGIN_ID,
@@ -389,9 +348,9 @@ export default {
         md += "\n## Configuration\n\n";
         md += "| Setting | Value |\n|---------|-------|\n";
         md += `| Idle threshold | ${config.idleThresholdMs / 1000}s |\n`;
-        md += `| Verify delay | ${config.verifyDelayMs / 1000}s |\n`;
         md += `| Max wakes per stall | ${config.maxWakes} |\n`;
         md += `| Max wakes per session | ${config.maxWakesEver} |\n`;
+        md += `| Done busy threshold | ${config.doneMaxBusyMs / 1000}s |\n`;
         md += `| Wake message | \`${WAKE_MESSAGE}\` |\n`;
 
         if (sessions.size > 0) {
@@ -416,9 +375,15 @@ export default {
     });
 
     // ── Agent lifecycle ─────────────────────────────────────────────
+    // Only agent-started creates a session tracker. All other handlers
+    // use sessions.get() — non-agent terminals are never tracked.
     host.onStateChange((event) => {
       if (event.type === "agent-started" && event.sessionId) {
-        getSession(event.sessionId);
+        let s = sessions.get(event.sessionId);
+        if (!s) {
+          s = new SessionTracker();
+          sessions.set(event.sessionId, s);
+        }
         host.log("info", `Agent started in ${event.sessionId.slice(0, 8)} — tracking`);
       }
       if (event.type === "agent-stopped" && event.sessionId) {
@@ -428,35 +393,85 @@ export default {
 
     // ── Shell state ──────────────────────────────────────────────────
     host.registerStructuredEventHandler("shell-state", (payload, sessionId) => {
-      const session = getSession(sessionId);
+      let session = sessions.get(sessionId);
+      if (!session) {
+        // Late discovery: plugin was (re)loaded after the agent started.
+        // The registry's agentTypes filter guarantees this handler only
+        // fires for claude sessions, so safe to auto-register — but only
+        // do it once per session (avoid re-creating after agent-stopped).
+        session = new SessionTracker();
+        sessions.set(sessionId, session);
+        host.log("info", `Late-discovered agent ${sessionId.slice(0, 8)}`);
+      }
       const prev = session.shellState;
       session.shellState = payload.state;
       const now = Date.now();
 
       if (payload.state === "busy") {
         session.lastBusyAt = now;
-        // Busy preceded by a real user turn → re-arm
-        if (
-          session.disarmed &&
-          session.lastUserInputAt > 0 &&
-          now - session.lastUserInputAt < 5 * 60 * 1000
-        ) {
-          session.disarmed = false;
-          session.wakeCount = 0;
-          host.log("info", `Re-armed on user-driven busy → ${sessionId.slice(0, 8)}`);
+        // Track that the agent started processing after our wake
+        if (session.pendingWake && !session.wakeBusySeen) {
+          session.wakeBusySeen = true;
+          host.log("debug", `Wake-busy started → ${sessionId.slice(0, 8)}`);
         }
         return;
       }
 
       if (payload.state === "idle") {
-        // Short busy blips don't count as real activity — ignore them.
         if (prev === "busy") {
           const busyDuration = session.lastBusyAt ? now - session.lastBusyAt : 0;
-          if (busyDuration < config.minBusyDurationMs) {
-            // Keep existing idle timer running.
+
+          // ALWAYS reset the idle clock — even for short blips (typing).
+          // Without this, typing doesn't push lastIdleAt forward and
+          // canWake fires while the user is actively present.
+          session.lastIdleAt = now;
+
+          // PRIMARY "done" detection: short busy cycle after wake = agent
+          // just acknowledged briefly (replied "done" or similar).
+          if (session.pendingWake && session.wakeBusySeen && busyDuration < config.doneMaxBusyMs) {
+            host.log("info", `Short busy cycle ${Math.round(busyDuration / 1000)}s after wake → treating as done`);
+            confirmDone(sessionId, `short-busy-${Math.round(busyDuration / 1000)}s`);
             return;
           }
-          session.lastIdleAt = now;
+
+          // Long busy cycle after wake = agent continued working.
+          if (session.pendingWake && session.wakeBusySeen && busyDuration >= config.doneMaxBusyMs) {
+            host.log("info", `Long busy cycle ${Math.round(busyDuration / 1000)}s after wake → agent continued, clearing pending`);
+            session.pendingWake = false;
+            session.pendingWakeAt = 0;
+            session.wakeBusySeen = false;
+          }
+
+          // Skip re-arm/question logic for short blips (typing, spinner)
+          if (busyDuration < config.minBusyDurationMs) {
+            return;
+          }
+
+          // Re-arm only if user gave NEW input AFTER the disarm timestamp
+          if (
+            session.disarmed &&
+            busyDuration > 10000 &&
+            session.lastUserInputAt > session.disarmedAt &&
+            now - session.lastUserInputAt < 5 * 60 * 1000
+          ) {
+            session.disarmed = false;
+            session.disarmedAt = 0;
+            session.wakeCount = 0;
+            host.log("info", `Re-armed after ${Math.round(busyDuration / 1000)}s busy → ${sessionId.slice(0, 8)}`);
+          }
+
+          // If pending wake and a question appeared, cancel the wake
+          if (session.pendingWake) {
+            const hasQuestion = session.hasQuestionAt > 0 && now - session.hasQuestionAt < config.questionStaleMs;
+            if (hasQuestion) {
+              session.pendingWake = false;
+              session.pendingWakeAt = 0;
+              session.wakeBusySeen = false;
+              session.wakeCount = Math.max(0, session.wakeCount - 1);
+              session.totalWakesEver = Math.max(0, session.totalWakesEver - 1);
+              host.log("info", `Wake cancelled — question detected → ${sessionId.slice(0, 8)}`);
+            }
+          }
           return;
         }
         if (session.lastIdleAt === 0) session.lastIdleAt = now;
@@ -465,39 +480,45 @@ export default {
 
     // ── Question (pending answer from user) ─────────────────────────
     host.registerStructuredEventHandler("question", (_payload, sessionId) => {
-      const session = getSession(sessionId);
+      const session = sessions.get(sessionId);
+      if (!session) return;
       session.hasQuestionAt = Date.now();
     });
 
     // ── Sub-tasks running (background work) ─────────────────────────
     host.registerStructuredEventHandler("active-subtasks", (payload, sessionId) => {
-      const session = getSession(sessionId);
+      const session = sessions.get(sessionId);
+      if (!session) return;
       session.activeSubtasks = payload?.count ?? 0;
     });
 
     // ── Choice prompts (numbered menus) ─────────────────────────────
     host.registerStructuredEventHandler("choice-prompt", (_payload, sessionId) => {
-      const session = getSession(sessionId);
+      const session = sessions.get(sessionId);
+      if (!session) return;
       session.choicePromptActive = true;
     });
 
     // ── Real user input — re-arms and clears question/choice state ──
     host.registerStructuredEventHandler("user-input", (payload, sessionId) => {
       const content = payload?.content ?? "";
-      if (content.includes(WAKE_MESSAGE)) return; // our own wake — ignore
-      const session = getSession(sessionId);
+      if (content.includes(WAKE_MESSAGE)) return;
+      const session = sessions.get(sessionId);
+      if (!session) return;
       session.lastUserInputAt = Date.now();
       session.hasQuestionAt = 0;
       session.choicePromptActive = false;
-      // Real input → new stall context; reset per-stall counter
       session.wakeCount = 0;
     });
 
     // ── Usage exhausted — stop waking ───────────────────────────────
     host.registerStructuredEventHandler("usage-exhausted", (_payload, sessionId) => {
-      const session = getSession(sessionId);
+      const session = sessions.get(sessionId);
+      if (!session) return;
       session.disarmed = true;
+      session.disarmedAt = Date.now();
       session.pendingWake = false;
+      session.wakeBusySeen = false;
       host.log("warn", `Usage exhausted → disarming wakeup for ${sessionId.slice(0, 8)}`);
     });
 
