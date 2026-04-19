@@ -249,7 +249,14 @@ function expirePendingWake(sessionId) {
   session.lastIdleAt = Date.now();
 
   stats.record(sessionId, "no-reply");
-  hostRef.log("info", `Wakeup no done reply within timeout → ${sessionId.slice(0, 8)}, will retry`);
+
+  if (session.wakeCount >= config.maxWakes) {
+    session.disarmed = true;
+    session.disarmedAt = Date.now();
+    hostRef.log("warn", `${config.maxWakes} no-replies → disarming ${sessionId.slice(0, 8)} until next user turn`);
+  } else {
+    hostRef.log("info", `Wakeup no reply (${session.wakeCount}/${config.maxWakes}) → ${sessionId.slice(0, 8)}, will retry`);
+  }
 
   saveStats();
   updateDashboard();
@@ -447,11 +454,14 @@ export default {
             return;
           }
 
-          // Re-arm only if user gave NEW input AFTER the disarm timestamp
+          // Re-arm only if user gave NEW input AFTER both the disarm AND the
+          // last wake sent. Without the lastWakeSentAt guard, the wake's own
+          // busy cycle could re-arm the session immediately.
           if (
             session.disarmed &&
             busyDuration > 10000 &&
             session.lastUserInputAt > session.disarmedAt &&
+            session.lastUserInputAt > session.lastWakeSentAt &&
             now - session.lastUserInputAt < 5 * 60 * 1000
           ) {
             session.disarmed = false;
