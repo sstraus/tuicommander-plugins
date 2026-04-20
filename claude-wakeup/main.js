@@ -400,16 +400,8 @@ export default {
 
     // ── Shell state ──────────────────────────────────────────────────
     host.registerStructuredEventHandler("shell-state", (payload, sessionId) => {
-      let session = sessions.get(sessionId);
-      if (!session) {
-        // Late discovery: plugin was (re)loaded after the agent started.
-        // The registry's agentTypes filter guarantees this handler only
-        // fires for claude sessions, so safe to auto-register — but only
-        // do it once per session (avoid re-creating after agent-stopped).
-        session = new SessionTracker();
-        sessions.set(sessionId, session);
-        host.log("info", `Late-discovered agent ${sessionId.slice(0, 8)}`);
-      }
+      const session = sessions.get(sessionId);
+      if (!session) return;
       const prev = session.shellState;
       session.shellState = payload.state;
       const now = Date.now();
