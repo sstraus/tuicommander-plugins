@@ -843,6 +843,7 @@ export default {
 
     // ── Shell state tracking ─────────────────────────────────────
     host.registerStructuredEventHandler("shell-state", (payload, sessionId) => {
+      if (!payload.agent_type) return;
       const session = getSession(sessionId);
       const prev = session.shellState;
       session.shellState = payload.state;

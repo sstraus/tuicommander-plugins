@@ -400,6 +400,7 @@ export default {
 
     // ── Shell state ──────────────────────────────────────────────────
     host.registerStructuredEventHandler("shell-state", (payload, sessionId) => {
+      if (!payload.agent_type) return;
       const session = sessions.get(sessionId);
       if (!session) return;
       const prev = session.shellState;
