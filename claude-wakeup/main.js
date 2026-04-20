@@ -123,11 +123,13 @@ function updateDashboard() {
 // ── Output matching (secondary fast-path) ────────────────────────────
 
 const DONE_RE = /^[\s\-*>⏺·•]*done[.!?"'`,:;]*\s*$/i;
+const ANSI_RE = /\x1b\[[0-9;]*[A-Za-z]/g;
 
 function isDoneReply(line) {
-  if (line.includes(WAKE_MESSAGE)) return false;
-  if (line.includes("Continue") && line.includes("finished")) return false;
-  return DONE_RE.test(line);
+  const clean = line.replace(ANSI_RE, "");
+  if (clean.includes(WAKE_MESSAGE)) return false;
+  if (clean.includes("Continue") && clean.includes("finished")) return false;
+  return DONE_RE.test(clean);
 }
 
 // ── Wakeup check ─────────────────────────────────────────────────────
@@ -314,18 +316,20 @@ export default {
       canDismissAll: false,
     });
 
-    // OutputWatcher: secondary fast-path for "done" detection.
-    // Primary detection is via busy-cycle duration in the shell-state handler.
-    // This catches cases where the agent emits a clean "done" line before
-    // the busy→idle transition is processed.
+    // OutputWatcher: catches "done" in PTY output. Uses a time window from
+    // lastWakeSentAt rather than gating on pendingWake, because the busy→idle
+    // handler may clear pendingWake (long cycle) before the watcher fires.
     host.registerOutputWatcher({
       pattern: /done/i,
       onMatch(match, sessionId) {
         const session = sessions.get(sessionId);
-        if (!session?.pendingWake) return;
+        if (!session) return;
+        if (session.disarmed) return;
+        const sinceWake = Date.now() - (session.lastWakeSentAt || 0);
+        if (!session.lastWakeSentAt || sinceWake > config.pendingTimeoutMs) return;
         const fullLine = match.input ?? "";
         if (isDoneReply(fullLine)) {
-          host.log("info", `OutputWatcher fast-path: "${fullLine}"`);
+          host.log("info", `OutputWatcher: "${fullLine}" (${Math.round(sinceWake / 1000)}s after wake)`);
           confirmDone(sessionId, "output-watcher");
         }
       },
