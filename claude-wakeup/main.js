@@ -191,7 +191,19 @@ function checkWakeups() {
     });
 
     hostRef
-      .sendAgentInput(sessionId, WAKE_MESSAGE)
+      .invoke("get_input_buffer_content", { sessionId })
+      .then((content) => {
+        if (content && content.trim().length > 0) {
+          hostRef.log("info", `Wakeup skipped — user is typing in ${sessionId.slice(0, 8)}`);
+          session.pendingWake = false;
+          session.pendingWakeAt = 0;
+          session.wakeBusySeen = false;
+          session.wakeCount--;
+          session.totalWakesEver--;
+          return;
+        }
+        return hostRef.sendAgentInput(sessionId, WAKE_MESSAGE);
+      })
       .catch((err) => {
         const msg = String(err);
         if (msg.includes("not found") || msg.includes("No such session")) {
