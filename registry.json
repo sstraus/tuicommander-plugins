@@ -43,5 +43,16 @@
     "capabilities": ["exec:cli", "ui:panel", "ui:context-menu"],
     "binaries": ["rtk"],
     "downloadUrl": "https://github.com/sstraus/tuicommander-plugins/releases/latest/download/rtk-dashboard.zip"
+  },
+  {
+    "id": "wiz-kanban",
+    "name": "Wiz Kanban",
+    "description": "Wiz framework plugin that visualizes a kanban board for managing the workflow of plans, stories, and reviews.",
+    "author": "sstraus",
+    "repo": "sstraus/tuicommander-plugins",
+    "latestVersion": "2.0.0",
+    "minAppVersion": "0.5.0",
+    "capabilities": ["fs:read", "fs:list", "fs:watch", "fs:write", "fs:rename", "ui:panel", "ui:markdown", "pty:write", "ui:context-menu"],
+    "downloadUrl": "https://github.com/sstraus/tuicommander-plugins/releases/latest/download/wiz-kanban.zip"
   }
 ]

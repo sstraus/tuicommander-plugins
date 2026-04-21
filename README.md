@@ -9,6 +9,7 @@ Community plugin registry and distributable plugins for [TUICommander](https://g
 | [cache-keepalive](cache-keepalive/) | Prevents Claude API prompt cache expiry during idle periods | `pty:write`, `ui:ticker` |
 | [mdkb-dashboard](mdkb-dashboard/) | mdkb knowledge base status, memories, config | `exec:cli`, `fs:read`, `ui:panel`, `ui:ticker` |
 | [tuic-vscode-icons](tuic-vscode-icons/) | 1500+ file and folder icons from vscode-icons | `ui:file-icons` |
+| [wiz-kanban](wiz-kanban/) | Wiz framework workflow kanban for plans, stories, and reviews | `fs:read`, `fs:write`, `ui:panel`, `pty:write` |
 
 ## registry.json
 
