@@ -33,6 +33,18 @@
     "downloadUrl": "https://github.com/sstraus/tuicommander-plugins/releases/latest/download/cache-keepalive.zip"
   },
   {
+    "id": "claude-wakeup",
+    "name": "Claude Wakeup",
+    "description": "Wakes Claude Code when it stalls without asking a question. Sends a verification prompt after idle timeout; accepts done as completion signal.",
+    "author": "sstraus",
+    "repo": "sstraus/tuicommander-plugins",
+    "latestVersion": "1.0.0",
+    "minAppVersion": "0.9.8",
+    "capabilities": ["pty:write", "pty:read", "ui:ticker", "ui:markdown"],
+    "agentTypes": ["claude"],
+    "downloadUrl": "https://github.com/sstraus/tuicommander-plugins/releases/latest/download/claude-wakeup.zip"
+  },
+  {
     "id": "rtk-dashboard",
     "name": "RTK Token Savings Dashboard",
     "description": "Visualizes RTK token savings, command history, and missed optimization opportunities.",
