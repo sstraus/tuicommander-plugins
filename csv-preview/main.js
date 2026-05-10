@@ -4,13 +4,14 @@ export default {
 	id: "csv-preview",
 	onload(host) {
 		host.registerFilePreview({
-			extensions: ["csv", "tsv"],
+			extensions: ["csv", "tsv", "psv", "ssv"],
 			async onOpen(ctx) {
 				const abs = ctx.fsRoot
 					? `${ctx.fsRoot}/${ctx.filePath}`
 					: ctx.filePath;
 				const raw = await host.readFile(abs);
-				const delimiter = ctx.filePath.endsWith(".tsv") ? "\t" : ",";
+				const ext = ctx.filePath.split(".").pop()?.toLowerCase();
+				const delimiter = ext === "tsv" ? "\t" : ext === "psv" ? "|" : ext === "ssv" ? ";" : ",";
 				const rows = parseCsv(raw, delimiter);
 				const html = buildTableHtml(rows, ctx.filePath);
 				host.openPanel({

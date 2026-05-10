@@ -22,6 +22,9 @@ const ICON = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="
 const WAKE_MESSAGE =
   "Continue, or reply `done` if finished.";
 
+const ERROR_LOOP_MESSAGE =
+  "You have hit multiple consecutive errors. Stop, re-check your working directory and assumptions, then try a different approach.";
+
 const DEFAULTS = {
   idleThresholdMs: 20 * 1000,
   maxWakes: 3,
@@ -32,6 +35,8 @@ const DEFAULTS = {
   pendingTimeoutMs: 60 * 1000,
   /** Busy cycle shorter than this after a wake = agent acknowledged ("done"). */
   doneMaxBusyMs: 8 * 1000,
+  /** Consecutive tool errors before sending an error-loop nudge. */
+  errorLoopThreshold: 3,
 };
 
 // ── Per-session state ────────────────────────────────────────────────
@@ -53,6 +58,8 @@ class SessionTracker {
     this.pendingWakeAt = 0;
     this.lastWakeSentAt = 0;
     this.wakeBusySeen = false;
+    this.consecutiveErrors = 0;
+    this.errorLoopNudged = false;
   }
 }
 
@@ -196,7 +203,7 @@ function checkWakeups() {
       .invoke("get_input_buffer_content", { sessionId })
       .then((content) => {
         if (content && content.trim().length > 0) {
-          hostRef.log("info", `Wakeup skipped — user is typing in ${sessionId.slice(0, 8)}`);
+          hostRef.log("debug", `Wakeup skipped — user typing in ${sessionId.slice(0, 8)}`);
           session.pendingWake = false;
           session.pendingWakeAt = 0;
           session.wakeBusySeen = false;
@@ -528,6 +535,8 @@ export default {
       session.hasQuestionAt = 0;
       session.choicePromptActive = false;
       session.wakeCount = 0;
+      session.consecutiveErrors = 0;
+      session.errorLoopNudged = false;
     });
 
     // ── Usage exhausted — stop waking ───────────────────────────────
@@ -539,6 +548,40 @@ export default {
       session.pendingWake = false;
       session.wakeBusySeen = false;
       host.log("warn", `Usage exhausted → disarming wakeup for ${sessionId.slice(0, 8)}`);
+    });
+
+    // ── Tool errors — detect error loops ─────────────────────────────
+    host.registerStructuredEventHandler("tool-error", (_payload, sessionId) => {
+      const session = sessions.get(sessionId);
+      if (!session) return;
+      if (session.disarmed) return;
+
+      session.consecutiveErrors++;
+      host.log("debug", `Tool error ${session.consecutiveErrors}/${config.errorLoopThreshold} → ${sessionId.slice(0, 8)}`);
+
+      if (session.consecutiveErrors >= config.errorLoopThreshold && !session.errorLoopNudged) {
+        session.errorLoopNudged = true;
+        session.wakeCount++;
+        session.totalWakesEver++;
+
+        host.log("warn", `Error loop (${session.consecutiveErrors} consecutive) → nudging ${sessionId.slice(0, 8)}`);
+        host.setTicker({
+          id: `${PLUGIN_ID}:status`,
+          text: `Error loop (${session.consecutiveErrors}×)`,
+          label: "Wakeup",
+          icon: ICON,
+          priority: 40,
+          ttlMs: 15000,
+        });
+
+        host.sendAgentInput(sessionId, ERROR_LOOP_MESSAGE).catch((err) => {
+          host.log("error", `Error-loop nudge failed: ${err}`);
+        });
+
+        stats.record(sessionId, "error-loop");
+        saveStats();
+        updateDashboard();
+      }
     });
 
     // ── Session closed ──────────────────────────────────────────────
