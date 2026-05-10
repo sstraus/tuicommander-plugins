@@ -1,0 +1,10 @@
+{
+  "id": "csv-preview",
+  "name": "CSV Preview",
+  "version": "1.0.0",
+  "minAppVersion": "0.9.8",
+  "main": "main.js",
+  "description": "Preview CSV/TSV files as sortable HTML tables",
+  "author": "TUICommander",
+  "capabilities": ["ui:file-preview", "ui:panel", "fs:read"]
+}
