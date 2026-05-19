@@ -129,12 +129,14 @@ function updateDashboard() {
 
 // ── Output matching (secondary fast-path) ────────────────────────────
 
-const DONE_RE = /^[\s\-*>⏺·•]*done[.!?"'`,:;]*\s*$/i;
+const DONE_RE = /^[\s\-*>⏺●◉⬤·•]*done[.!?"'`,:;]*\s*$/i;
 const ANSI_RE = /\x1b\[[0-9;]*[A-Za-z]/g;
+
+const WAKE_MESSAGE_CLEAN = WAKE_MESSAGE.replace(/`/g, "");
 
 function isDoneReply(line) {
   const clean = line.replace(ANSI_RE, "");
-  if (clean.includes(WAKE_MESSAGE)) return false;
+  if (clean.includes(WAKE_MESSAGE) || clean.includes(WAKE_MESSAGE_CLEAN)) return false;
   if (clean.includes("Continue") && clean.includes("finished")) return false;
   return DONE_RE.test(clean);
 }
@@ -422,8 +424,11 @@ export default {
     });
 
     // ── Shell state ──────────────────────────────────────────────────
+    // No agent_type guard here — pluginMatchesSession already filters
+    // by agentTypes:["claude"]. The extra guard blocked events from
+    // synthetic replays and edge cases where the Rust payload omitted
+    // agent_type, breaking busy→idle tracking and done detection.
     host.registerStructuredEventHandler("shell-state", (payload, sessionId) => {
-      if (!payload.agent_type) return;
       const session = sessions.get(sessionId);
       if (!session) return;
       const prev = session.shellState;
