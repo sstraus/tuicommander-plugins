@@ -211,6 +211,11 @@ function checkWakeups() {
           session.wakeBusySeen = false;
           session.wakeCount--;
           session.totalWakesEver--;
+          // Unsent text in the input buffer is user composition activity.
+          // Record it so canWake()'s idle guard suppresses re-attempts for
+          // idleThresholdMs*2 instead of busy-retrying every checkIntervalMs
+          // (which logged + IPC'd every 5s forever while text sat unsent).
+          session.lastUserInputAt = now;
           return;
         }
         return hostRef.sendAgentInput(sessionId, WAKE_MESSAGE);
