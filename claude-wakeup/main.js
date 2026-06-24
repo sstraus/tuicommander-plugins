@@ -107,6 +107,9 @@ let checkTimer = null;
 let hostRef = null;
 let config = { ...DEFAULTS };
 let stats = new Stats();
+/** Wall-clock time of the previous checkWakeups tick, for sleep/wake gap
+ *  detection. 0 until the first tick. */
+let lastCheckAt = 0;
 
 function saveStats() {
   if (!hostRef) return;
@@ -130,15 +133,27 @@ function updateDashboard() {
 // ── Output matching (secondary fast-path) ────────────────────────────
 
 const DONE_RE = /^[\s\-*>⏺●◉⬤·•]*done[.!?"'`,:;]*\s*$/i;
-const ANSI_RE = /\x1b\[[0-9;]*[A-Za-z]/g;
+// Strip full CSI sequences (params 0x30-0x3f, intermediates 0x20-0x2f,
+// final 0x40-0x7e). The old `[0-9;]*[A-Za-z]` form missed private-mode
+// sequences like `\x1b[?25h` (the `?` is 0x3f), leaving `?25h` garbage that
+// broke isDoneReply's anchored match on the agent's "done" line.
+const ANSI_RE = /\x1b\[[\x30-\x3f]*[\x20-\x2f]*[\x40-\x7e]/g;
 
 const WAKE_MESSAGE_CLEAN = WAKE_MESSAGE.replace(/`/g, "");
 
+/** True if `text` is (an echo of) our own wake nudge — backticks may be
+ *  stripped by terminal rendering, so match the cleaned form and a loose
+ *  heuristic too. Used both to reject false "done" matches and to keep the
+ *  wake's own user-input echo from re-arming the session. */
+function isWakeMessage(text) {
+  const clean = text.replace(ANSI_RE, "");
+  if (clean.includes(WAKE_MESSAGE) || clean.includes(WAKE_MESSAGE_CLEAN)) return true;
+  return clean.includes("Continue") && clean.includes("finished");
+}
+
 function isDoneReply(line) {
-  const clean = line.replace(ANSI_RE, "");
-  if (clean.includes(WAKE_MESSAGE) || clean.includes(WAKE_MESSAGE_CLEAN)) return false;
-  if (clean.includes("Continue") && clean.includes("finished")) return false;
-  return DONE_RE.test(clean);
+  if (isWakeMessage(line)) return false;
+  return DONE_RE.test(line.replace(ANSI_RE, ""));
 }
 
 // ── Wakeup check ─────────────────────────────────────────────────────
@@ -165,6 +180,32 @@ function canWake(session, now) {
 function checkWakeups() {
   if (!hostRef) return;
   const now = Date.now();
+
+  // Sleep/wake detection. setInterval is suspended while the machine sleeps,
+  // so on resume the gap since the last tick is the whole sleep duration. The
+  // idle/input/question guards are all Date.now() deltas — after a long sleep
+  // they're stale, making every tracked session look wake-eligible (idle for
+  // hours, no recent input, no recent question) and firing a burst of nudges
+  // on resume. Reset each session's idle clock, drop in-flight wakes, and skip
+  // this round. Threshold scales with checkIntervalMs so a long configured
+  // interval never self-reads as sleep. Mirrors cpu_watchdog.rs.
+  const sleepGapMs = Math.max(30 * 1000, config.checkIntervalMs * 4);
+  if (lastCheckAt > 0 && now - lastCheckAt > sleepGapMs) {
+    hostRef.log(
+      "info",
+      `Sleep/wake gap ${Math.round((now - lastCheckAt) / 1000)}s — resetting idle clocks, skipping tick`
+    );
+    for (const session of sessions.values()) {
+      session.lastIdleAt = now;
+      session.lastBusyAt = now;
+      session.pendingWake = false;
+      session.pendingWakeAt = 0;
+      session.wakeBusySeen = false;
+    }
+    lastCheckAt = now;
+    return;
+  }
+  lastCheckAt = now;
 
   for (const [sessionId, session] of sessions) {
     if (
@@ -538,7 +579,10 @@ export default {
     // ── Real user input — re-arms and clears question/choice state ──
     host.registerStructuredEventHandler("user-input", (payload, sessionId) => {
       const content = payload?.content ?? "";
-      if (content.includes(WAKE_MESSAGE)) return;
+      // Our own wake nudge echoes back as a user-input event. Never let it
+      // reset wakeCount (which would defeat the maxWakes cap) or re-arm.
+      // Match the cleaned form too — terminal rendering may strip backticks.
+      if (isWakeMessage(content)) return;
       const session = sessions.get(sessionId);
       if (!session) return;
       session.lastUserInputAt = Date.now();
