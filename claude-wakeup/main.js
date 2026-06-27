@@ -48,6 +48,11 @@ class SessionTracker {
     this.lastBusyAt = 0;
     this.lastUserInputAt = 0;
     this.hasQuestionAt = 0;
+    // Authoritative awaiting flag pushed by the backend (story 060). Unlike the
+    // flappy hasQuestionAt heuristic, this stays true for the whole time the
+    // backend considers the agent parked at a prompt, and clears only when the
+    // backend clears it (user-input). canWake() treats it as a hard gate.
+    this.backendAwaiting = false;
     this.activeSubtasks = 0;
     this.choicePromptActive = false;
     this.disarmed = false;
@@ -166,6 +171,9 @@ function canWake(session, now) {
   if (session.totalWakesEver >= config.maxWakesEver) return false;
   if (session.activeSubtasks > 0) return false;
   if (session.choicePromptActive) return false;
+  // Authoritative backend awaiting flag (060) — never nudge a session the
+  // backend marks as parked at a prompt. Hard gate above the flappy heuristic.
+  if (session.backendAwaiting) return false;
   if (session.hasQuestionAt > 0 && now - session.hasQuestionAt < config.questionStaleMs) {
     return false;
   }
@@ -560,6 +568,16 @@ export default {
       const session = sessions.get(sessionId);
       if (!session) return;
       session.hasQuestionAt = Date.now();
+    });
+
+    // ── Authoritative awaiting state from the backend (story 060) ────
+    // The backend accumulator is the source of truth for whether the agent is
+    // parked at a prompt. Mirror it so canWake() never nudges a session the
+    // backend marks awaiting_input=true, regardless of the flappy heuristic.
+    host.registerStructuredEventHandler("awaiting", (payload, sessionId) => {
+      const session = sessions.get(sessionId);
+      if (!session) return;
+      session.backendAwaiting = !!payload?.awaiting;
     });
 
     // ── Sub-tasks running (background work) ─────────────────────────
