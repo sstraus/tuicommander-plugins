@@ -1,0 +1,553 @@
+/**
+ * Build Artifacts Cleaner — reclaim disk from stale build directories.
+ *
+ * Scans registered repos for build-artifact dirs (target/, node_modules/, .venv,
+ * __pycache__, obj/bin, .gradle), shows per-repo sizes + last-build age in a
+ * dashboard, offers a guarded one-click cleanup, and warns via the bell + status
+ * ticker when reclaimable disk crosses a configurable threshold.
+ *
+ * Capabilities: fs:scan (read-only walk), fs:delete (guarded remove_dir_all),
+ *               ui:panel (dashboard), ui:ticker (status bar warning).
+ *
+ * The Rust backend owns the sharp edges: scan_build_artifacts ignores gitignore
+ * and stops-at-match (no double counting); delete_build_artifact re-validates
+ * containment inside a registered repo before removing anything. This JS only
+ * renders and orchestrates.
+ */
+
+const PLUGIN_ID = "build-cleaner";
+const SECTION_ID = "build-cleaner";
+const TICKER_ID = `${PLUGIN_ID}:reclaimable`;
+const BELL_ID = `${PLUGIN_ID}:reclaimable`;
+
+const GIB = 1024 * 1024 * 1024;
+const HOUR_SECS = 3600;
+
+/** Human-readable label per artifact `kind` returned by the scanner. */
+const KIND_LABELS = {
+  rust: "Rust (target)",
+  node: "Node (node_modules)",
+  python: "Python (.venv / __pycache__)",
+  dotnet: ".NET (obj / bin)",
+  gradle: "Gradle (.gradle)",
+};
+
+/** All kinds the scanner can emit — the default enabled set. */
+const ALL_KINDS = ["rust", "node", "python", "dotnet", "gradle"];
+
+/**
+ * Default configuration. Overridden by persisted config (config.json) merged on
+ * load. Sizes in bytes, windows in seconds so no unit ambiguity crosses IPC.
+ */
+const DEFAULTS = {
+  perArtifactWarnBytes: 5 * GIB, // flag a single artifact this big
+  totalWarnBytes: 50 * GIB, // total reclaimable → "warn"
+  totalCriticalBytes: 150 * GIB, // total reclaimable → "critical"
+  hotWindowSecs: 24 * HOUR_SECS, // artifacts built within this are excluded (active builds)
+  pollIntervalMs: 5 * 60 * 1000, // background threshold poll cadence (mirrors claudeUsage)
+  enabledKinds: [...ALL_KINDS],
+};
+
+const ICON = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="currentColor"><path d="M13.78 1.22a.75.75 0 0 1 0 1.06l-2.03 2.03 1.06 1.06a.75.75 0 0 1-.16 1.2l-1.1.55-4.6 4.6a2.5 2.5 0 0 1-1.2.67l-3.2.73a.75.75 0 0 1-.9-.9l.73-3.2a2.5 2.5 0 0 1 .67-1.2l4.6-4.6.55-1.1a.75.75 0 0 1 1.2-.16l1.06 1.06 2.03-2.03a.75.75 0 0 1 1.06 0zM6.1 6.9 2.6 10.4a1 1 0 0 0-.27.48l-.5 2.2 2.2-.5a1 1 0 0 0 .48-.27L8.7 8.9 6.1 6.9z"/></svg>`;
+
+// ---------------------------------------------------------------------------
+// Pure helpers (exported for unit testing — the plugin loader only reads
+// `.default`, so these named exports are inert at runtime)
+// ---------------------------------------------------------------------------
+
+/** Format a byte count as a compact binary-unit string (KiB/MiB/GiB/TiB). */
+export function fmtBytes(n) {
+  if (!Number.isFinite(n) || n <= 0) return "0 B";
+  const units = ["B", "KiB", "MiB", "GiB", "TiB"];
+  let i = 0;
+  let v = n;
+  while (v >= 1024 && i < units.length - 1) {
+    v /= 1024;
+    i += 1;
+  }
+  // One decimal for sub-100 values, whole for the rest; drop a trailing ".0".
+  const rounded = v >= 100 || i === 0 ? Math.round(v) : Math.round(v * 10) / 10;
+  return `${rounded} ${units[i]}`;
+}
+
+/**
+ * Format an age (now − mtime) as a coarse human string. Returns "—" for an
+ * unknown mtime (0, which the scanner emits when a dir is unreadable/empty).
+ */
+export function fmtAge(mtimeSecs, nowSecs) {
+  if (!mtimeSecs) return "—";
+  const secs = Math.max(0, nowSecs - mtimeSecs);
+  if (secs < HOUR_SECS) return `${Math.max(1, Math.round(secs / 60))}m`;
+  if (secs < 24 * HOUR_SECS) return `${Math.round(secs / HOUR_SECS)}h`;
+  const days = Math.round(secs / (24 * HOUR_SECS));
+  if (days < 30) return `${days}d`;
+  return `${Math.round(days / 30)}mo`;
+}
+
+/** Basename of an absolute path (POSIX or Windows separators). */
+export function basename(p) {
+  const parts = String(p).split(/[/\\]/).filter(Boolean);
+  return parts.length ? parts[parts.length - 1] : p;
+}
+
+/** Path of `child` relative to `repo` root, for compact display. */
+export function relPath(child, repo) {
+  if (child.startsWith(repo)) {
+    const rest = child.slice(repo.length).replace(/^[/\\]+/, "");
+    return rest || basename(child);
+  }
+  return child;
+}
+
+/**
+ * Classify the current reclaimable footprint. Only artifacts that are (a) of an
+ * enabled kind and (b) OLDER than the hot-window count toward the nag total —
+ * a `target/` from a build 10 minutes ago is excluded so we don't pester during
+ * active work. A single stale artifact ≥ perArtifactWarnBytes also trips "warn".
+ *
+ * @returns {{severity:"none"|"warn"|"critical", totalBytes:number,
+ *            staleCount:number, largest:object|null}}
+ */
+export function evaluateThresholds(entries, cfg, nowSecs) {
+  const kinds = new Set(cfg.enabledKinds);
+  const stale = entries.filter(
+    (e) => kinds.has(e.kind) && nowSecs - e.last_modified_secs >= cfg.hotWindowSecs,
+  );
+  const totalBytes = stale.reduce((s, e) => s + e.size_bytes, 0);
+  const largest = stale.reduce((m, e) => (e.size_bytes > (m ? m.size_bytes : 0) ? e : m), null);
+
+  let severity = "none";
+  if (totalBytes >= cfg.totalCriticalBytes) {
+    severity = "critical";
+  } else if (
+    totalBytes >= cfg.totalWarnBytes ||
+    (largest && largest.size_bytes >= cfg.perArtifactWarnBytes)
+  ) {
+    severity = "warn";
+  }
+  return { severity, totalBytes, staleCount: stale.length, largest };
+}
+
+/** Ticker priority from severity — mirrors claudeUsage getTickerPriority tiers. */
+export function tickerPriority(severity) {
+  if (severity === "critical") return 90;
+  if (severity === "warn") return 50;
+  return 10;
+}
+
+function escapeHtml(str) {
+  return String(str)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+
+/** Config as GiB/hours for the settings form. Inverse of formToConfig. */
+export function configToForm(cfg) {
+  return {
+    perArtifactWarnGiB: +(cfg.perArtifactWarnBytes / GIB).toFixed(1),
+    totalWarnGiB: +(cfg.totalWarnBytes / GIB).toFixed(1),
+    totalCriticalGiB: +(cfg.totalCriticalBytes / GIB).toFixed(1),
+    hotWindowHours: +(cfg.hotWindowSecs / HOUR_SECS).toFixed(1),
+    enabledKinds: [...cfg.enabledKinds],
+  };
+}
+
+/** Build a validated config from raw settings-form values, clamped to sane bounds. */
+export function formToConfig(form, base) {
+  const pos = (v, fallback) => (Number.isFinite(+v) && +v > 0 ? +v : fallback);
+  const kinds = Array.isArray(form.enabledKinds)
+    ? form.enabledKinds.filter((k) => ALL_KINDS.includes(k))
+    : base.enabledKinds;
+  return {
+    ...base,
+    perArtifactWarnBytes: pos(form.perArtifactWarnGiB, base.perArtifactWarnBytes / GIB) * GIB,
+    totalWarnBytes: pos(form.totalWarnGiB, base.totalWarnBytes / GIB) * GIB,
+    totalCriticalBytes: pos(form.totalCriticalGiB, base.totalCriticalBytes / GIB) * GIB,
+    hotWindowSecs: pos(form.hotWindowHours, base.hotWindowSecs / HOUR_SECS) * HOUR_SECS,
+    enabledKinds: kinds.length ? kinds : [...ALL_KINDS],
+  };
+}
+
+/**
+ * Render the full dashboard HTML. Pure: given the same scan + config it returns
+ * identical markup, so it can be unit-tested and diffed. Groups artifacts by
+ * repo (largest repo first), totals in `.dash-stat` cards, one table per repo.
+ */
+export function buildPanelHtml(entries, cfg, nowSecs) {
+  const kinds = new Set(cfg.enabledKinds);
+  const visible = entries.filter((e) => kinds.has(e.kind));
+  const evalRes = evaluateThresholds(entries, cfg, nowSecs);
+  const form = configToForm(cfg);
+
+  const body = visible.length === 0 ? emptyState() : buildRepoSections(visible, cfg, nowSecs);
+  const stats = buildStatCards(visible, evalRes, cfg);
+  const settings = buildSettingsSection(form);
+
+  return `<!DOCTYPE html>
+<html>
+<head>
+<style>
+  /* Plugin-specific tweaks only — layout/cards/tables come from PLUGIN_BASE_CSS. */
+  .repo-total { color: var(--fg-secondary); font-weight: 500; }
+  .badge-hot { color: var(--warning); border-color: var(--warning); }
+  td.actions { text-align: right; white-space: nowrap; }
+  button.danger {
+    background: transparent; color: var(--error);
+    border: 1px solid var(--border); border-radius: 4px;
+    padding: 2px 10px; font-size: 11px; cursor: pointer;
+  }
+  button.danger:hover { background: var(--error); color: var(--bg-primary); border-color: var(--error); }
+  button.danger:disabled { opacity: 0.5; cursor: default; background: transparent; color: var(--fg-muted); }
+  details.settings { margin-top: 4px; }
+  details.settings summary { cursor: pointer; color: var(--fg-secondary); font-size: 12px; }
+  .settings-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px 16px; margin-top: 10px; }
+  .settings-grid label { display: flex; flex-direction: column; gap: 4px; font-size: 11px; color: var(--fg-secondary); }
+  .settings-grid input[type="number"] {
+    background: var(--bg-tertiary); color: var(--fg-primary);
+    border: 1px solid var(--border); border-radius: 4px; padding: 4px 6px; font-size: 12px;
+  }
+  .kinds { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 8px; }
+  .kinds label { display: flex; align-items: center; gap: 5px; font-size: 12px; color: var(--fg-secondary); }
+</style>
+</head>
+<body>
+<div class="dashboard">
+  <div class="dash-header">
+    <h1 class="dash-title">Build Artifacts Cleaner</h1>
+    <button id="btn-refresh" class="primary">Rescan</button>
+  </div>
+  ${stats}
+  ${body}
+  ${settings}
+</div>
+<script>
+  const post = (m) => window.parent.postMessage(m, "*");
+
+  document.getElementById("btn-refresh").addEventListener("click", () => post({ action: "refresh" }));
+
+  document.querySelectorAll("button.danger").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const path = btn.dataset.path;
+      const label = btn.dataset.label || path;
+      if (!window.confirm("Delete " + label + "?\\n\\nThis permanently removes the directory. It will be rebuilt on the next build.")) return;
+      document.querySelectorAll('button.danger[data-path="' + CSS.escape(path) + '"]').forEach((b) => {
+        b.disabled = true;
+        b.textContent = "Deleting…";
+      });
+      post({ action: "delete", path });
+    });
+  });
+
+  const saveBtn = document.getElementById("btn-save-config");
+  if (saveBtn) {
+    saveBtn.addEventListener("click", () => {
+      const num = (id) => parseFloat(document.getElementById(id).value);
+      const enabledKinds = Array.from(document.querySelectorAll(".kinds input:checked")).map((i) => i.value);
+      post({
+        action: "saveConfig",
+        config: {
+          perArtifactWarnGiB: num("cfg-perArtifact"),
+          totalWarnGiB: num("cfg-totalWarn"),
+          totalCriticalGiB: num("cfg-totalCritical"),
+          hotWindowHours: num("cfg-hotWindow"),
+          enabledKinds,
+        },
+      });
+    });
+  }
+</script>
+</body>
+</html>`;
+}
+
+function emptyState() {
+  return `<div class="empty-state">No build artifacts found in your registered repos. Nothing to reclaim.</div>`;
+}
+
+function buildStatCards(visible, evalRes, cfg) {
+  const totalAll = visible.reduce((s, e) => s + e.size_bytes, 0);
+  const repos = new Set(visible.map((e) => e.repo)).size;
+  const meterPct = cfg.totalWarnBytes > 0 ? Math.min(100, (evalRes.totalBytes / cfg.totalWarnBytes) * 100) : 0;
+  const meterClass = evalRes.severity === "critical" ? "critical" : evalRes.severity === "warn" ? "warn" : "ok";
+  const meter = `<div class="dash-meter"><div class="dash-meter-fill ${meterClass}" style="width:${meterPct.toFixed(0)}%"></div></div>`;
+
+  const card = (label, value, extra = "") =>
+    `<div class="dash-stat"><div class="dash-stat-label">${label}</div><div class="dash-stat-value">${value}</div>${extra}</div>`;
+
+  return `<div class="dash-section">
+    <h2 class="dash-section-title">Overview <span class="dash-section-hint">reclaimable excludes the last ${Math.round(cfg.hotWindowSecs / HOUR_SECS)}h</span></h2>
+    <div class="dash-stat-grid">
+      ${card("Reclaimable", fmtBytes(evalRes.totalBytes), meter)}
+      ${card("Total on disk", fmtBytes(totalAll))}
+      ${card("Artifacts", String(visible.length))}
+      ${card("Repos", String(repos))}
+    </div>
+  </div>`;
+}
+
+function buildRepoSections(visible, cfg, nowSecs) {
+  const byRepo = new Map();
+  for (const e of visible) {
+    if (!byRepo.has(e.repo)) byRepo.set(e.repo, []);
+    byRepo.get(e.repo).push(e);
+  }
+
+  const repoTotals = [...byRepo.entries()]
+    .map(([repo, arts]) => ({ repo, arts, total: arts.reduce((s, e) => s + e.size_bytes, 0) }))
+    .sort((a, b) => b.total - a.total);
+
+  return repoTotals
+    .map(({ repo, arts, total }) => {
+      const rows = arts
+        .slice()
+        .sort((a, b) => b.size_bytes - a.size_bytes)
+        .map((e) => {
+          const hot = nowSecs - e.last_modified_secs < cfg.hotWindowSecs;
+          const hotBadge = hot ? ` <span class="badge badge-hot">recent</span>` : "";
+          const kindLabel = KIND_LABELS[e.kind] || e.kind;
+          return `<tr>
+            <td><code>${escapeHtml(relPath(e.path, repo))}</code>${hotBadge}</td>
+            <td>${escapeHtml(kindLabel)}</td>
+            <td class="num">${fmtBytes(e.size_bytes)}</td>
+            <td class="num">${fmtAge(e.last_modified_secs, nowSecs)}</td>
+            <td class="actions"><button class="danger" data-path="${escapeHtml(e.path)}" data-label="${escapeHtml(relPath(e.path, repo))}">Clean</button></td>
+          </tr>`;
+        })
+        .join("");
+
+      return `<div class="dash-section">
+        <h2 class="dash-section-title">${escapeHtml(basename(repo))} <span class="repo-total">${fmtBytes(total)}</span></h2>
+        <table>
+          <thead><tr><th>Path</th><th>Kind</th><th class="num">Size</th><th class="num">Age</th><th class="num">Action</th></tr></thead>
+          <tbody>${rows}</tbody>
+        </table>
+      </div>`;
+    })
+    .join("");
+}
+
+function buildSettingsSection(form) {
+  const kindCheckbox = (kind) =>
+    `<label><input type="checkbox" value="${kind}" ${form.enabledKinds.includes(kind) ? "checked" : ""}/> ${escapeHtml(KIND_LABELS[kind] || kind)}</label>`;
+
+  const numInput = (id, label, value) =>
+    `<label>${label}<input type="number" id="${id}" min="0" step="0.5" value="${value}"/></label>`;
+
+  return `<details class="settings">
+    <summary>Settings &amp; thresholds</summary>
+    <div class="dash-section">
+      <div class="settings-grid">
+        ${numInput("cfg-perArtifact", "Per-artifact warn (GiB)", form.perArtifactWarnGiB)}
+        ${numInput("cfg-hotWindow", "Hot-window exclude (hours)", form.hotWindowHours)}
+        ${numInput("cfg-totalWarn", "Total warn (GiB)", form.totalWarnGiB)}
+        ${numInput("cfg-totalCritical", "Total critical (GiB)", form.totalCriticalGiB)}
+      </div>
+      <div class="kinds">${ALL_KINDS.map(kindCheckbox).join("")}</div>
+      <div style="margin-top:12px"><button id="btn-save-config" class="primary">Save settings</button></div>
+    </div>
+  </details>`;
+}
+
+// ---------------------------------------------------------------------------
+// Runtime state + lifecycle
+// ---------------------------------------------------------------------------
+
+let hostRef = null;
+let panelHandle = null;
+let pollTimer = null;
+let config = { ...DEFAULTS };
+
+/** Wall-clock seconds. Isolated so tests can inject a fixed clock. */
+function nowSecs() {
+  return Math.floor(Date.now() / 1000);
+}
+
+function repoPaths() {
+  return hostRef
+    .getRepos()
+    .map((r) => r.path)
+    .filter(Boolean);
+}
+
+async function scan() {
+  const paths = repoPaths();
+  if (paths.length === 0) return [];
+  try {
+    return await hostRef.scanBuildArtifacts(paths);
+  } catch (err) {
+    hostRef.log("warn", `scan failed: ${err}`);
+    return [];
+  }
+}
+
+function renderPanel(entries) {
+  const html = buildPanelHtml(entries, config, nowSecs());
+  if (panelHandle) {
+    panelHandle.update(html);
+  }
+  return html;
+}
+
+async function openDashboard() {
+  const entries = await scan();
+  const html = buildPanelHtml(entries, config, nowSecs());
+  panelHandle = hostRef.openPanel({
+    id: PLUGIN_ID,
+    title: "Build Cleaner",
+    html,
+    onMessage: handlePanelMessage,
+  });
+}
+
+async function handlePanelMessage(msg) {
+  if (!msg || typeof msg !== "object") return;
+
+  if (msg.action === "refresh") {
+    renderPanel(await scan());
+    return;
+  }
+
+  if (msg.action === "delete" && typeof msg.path === "string") {
+    try {
+      await hostRef.deleteBuildArtifact(msg.path, repoPaths());
+      hostRef.log("info", `deleted ${msg.path}`);
+    } catch (err) {
+      hostRef.log("error", `delete failed for ${msg.path}: ${err}`);
+    }
+    const entries = await scan();
+    renderPanel(entries);
+    updateThresholdState(entries);
+    return;
+  }
+
+  if (msg.action === "saveConfig" && msg.config) {
+    config = formToConfig(msg.config, config);
+    await saveConfig();
+    const entries = await scan();
+    renderPanel(entries);
+    updateThresholdState(entries);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Threshold monitor (bell + ticker)
+// ---------------------------------------------------------------------------
+
+/** Ensure the Activity Center section exists, then apply/clear the bell + ticker. */
+function updateThresholdState(entries) {
+  const res = evaluateThresholds(entries, config, nowSecs());
+
+  if (res.severity === "none") {
+    hostRef.removeItem(BELL_ID);
+    hostRef.clearTicker(TICKER_ID);
+    return;
+  }
+
+  const sizeStr = fmtBytes(res.totalBytes);
+  const largestStr = res.largest ? `${fmtBytes(res.largest.size_bytes)} in ${basename(res.largest.repo)}` : "";
+
+  hostRef.addItem({
+    id: BELL_ID,
+    pluginId: PLUGIN_ID,
+    sectionId: SECTION_ID,
+    title: `${sizeStr} of build artifacts reclaimable`,
+    subtitle: largestStr ? `Largest: ${largestStr}` : `${res.staleCount} stale directories`,
+    icon: ICON,
+    severity: res.severity === "critical" ? "error" : "warn",
+    dismissible: true,
+    onClick: () => openDashboard(),
+  });
+
+  hostRef.setTicker({
+    id: TICKER_ID,
+    label: "Build",
+    text: `${sizeStr} reclaimable`,
+    icon: ICON,
+    priority: tickerPriority(res.severity),
+    onClick: () => openDashboard(),
+  });
+}
+
+async function poll() {
+  const entries = await scan();
+  updateThresholdState(entries);
+}
+
+// ---------------------------------------------------------------------------
+// Config persistence
+// ---------------------------------------------------------------------------
+
+async function loadConfig() {
+  try {
+    const raw = await hostRef.invoke("read_plugin_data", { pluginId: PLUGIN_ID, path: "config.json" });
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      config = { ...DEFAULTS, ...parsed };
+      // enabledKinds must stay a valid subset even if the stored file is stale.
+      if (!Array.isArray(config.enabledKinds) || config.enabledKinds.length === 0) {
+        config.enabledKinds = [...ALL_KINDS];
+      } else {
+        config.enabledKinds = config.enabledKinds.filter((k) => ALL_KINDS.includes(k));
+        if (config.enabledKinds.length === 0) config.enabledKinds = [...ALL_KINDS];
+      }
+    }
+  } catch {
+    config = { ...DEFAULTS };
+  }
+}
+
+async function saveConfig() {
+  try {
+    await hostRef.invoke("write_plugin_data", {
+      pluginId: PLUGIN_ID,
+      path: "config.json",
+      content: JSON.stringify(config),
+    });
+  } catch (err) {
+    hostRef.log("warn", `config persist failed: ${err}`);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Plugin export
+// ---------------------------------------------------------------------------
+
+export default {
+  id: PLUGIN_ID,
+
+  async onload(host) {
+    hostRef = host;
+
+    host.registerSection({
+      id: SECTION_ID,
+      label: "BUILD CLEANER",
+      priority: 55,
+      canDismissAll: true,
+    });
+
+    host.registerDashboard({
+      label: "Build Cleaner",
+      icon: ICON,
+      open: () => openDashboard(),
+    });
+
+    await loadConfig();
+
+    // Initial scan + threshold check, then poll on the configured cadence.
+    poll();
+    pollTimer = setInterval(poll, config.pollIntervalMs);
+  },
+
+  onunload() {
+    if (pollTimer) {
+      clearInterval(pollTimer);
+      pollTimer = null;
+    }
+    hostRef?.clearTicker(TICKER_ID);
+    hostRef?.removeItem(BELL_ID);
+    panelHandle = null;
+    hostRef = null;
+  },
+};
