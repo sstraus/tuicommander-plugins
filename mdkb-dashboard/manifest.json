@@ -1,10 +1,10 @@
 {
   "id": "mdkb-dashboard",
   "name": "mdkb Dashboard",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "minAppVersion": "0.3.0",
   "main": "main.js",
-  "description": "View mdkb knowledge base status, collections, memories, and configuration in an interactive panel.",
+  "description": "View the mdkb knowledge base index, collections, memories, code index, session usage, and hook health in an interactive panel, with one-click maintenance actions (reindex, code rebuild, re-embed, compact).",
   "author": "TUICommander",
   "capabilities": [
     "exec:cli",
