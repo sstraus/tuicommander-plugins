@@ -1,10 +1,15 @@
 {
   "id": "build-cleaner",
   "name": "Build Artifacts Cleaner",
-  "description": "Scans registered repos for build-artifact directories (target/, node_modules/, .venv, __pycache__, obj/bin, .gradle), shows per-repo sizes and last-build age, offers guarded one-click cleanup, and warns via the bell + status ticker when reclaimable disk crosses a threshold.",
-  "version": "1.0.0",
+  "description": "Scans registered repos for build-artifact directories across 15 toolchains (Rust/Maven target, node_modules, JS framework caches, Python caches, .NET obj/bin, Gradle/CMake/Flutter build, SwiftPM/CocoaPods, Terraform, Elixir, Zig, Haskell, Composer vendor), shows per-repo sizes and last-build age, offers guarded one-click cleanup, and warns via the bell + status ticker when reclaimable disk crosses a threshold.",
+  "version": "1.1.0",
   "author": "sstraus",
   "minAppVersion": "0.9.8",
   "main": "main.js",
-  "capabilities": ["fs:scan", "fs:delete", "ui:panel", "ui:ticker"]
+  "capabilities": [
+    "fs:scan",
+    "fs:delete",
+    "ui:panel",
+    "ui:ticker"
+  ]
 }

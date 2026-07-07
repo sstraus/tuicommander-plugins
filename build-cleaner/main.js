@@ -1,8 +1,9 @@
 /**
  * Build Artifacts Cleaner — reclaim disk from stale build directories.
  *
- * Scans registered repos for build-artifact dirs (target/, node_modules/, .venv,
- * __pycache__, obj/bin, .gradle), shows per-repo sizes + last-build age in a
+ * Scans registered repos for build-artifact dirs across 15 toolchains (see
+ * KIND_LABELS; the authoritative rule table is ARTIFACT_RULES in
+ * src-tauri/src/plugin_fs.rs), shows per-repo sizes + last-build age in a
  * dashboard, offers a guarded one-click cleanup, and warns via the bell + status
  * ticker when reclaimable disk crosses a configurable threshold.
  *
@@ -23,17 +24,28 @@ const BELL_ID = `${PLUGIN_ID}:reclaimable`;
 const GIB = 1024 * 1024 * 1024;
 const HOUR_SECS = 3600;
 
-/** Human-readable label per artifact `kind` returned by the scanner. */
+/** Human-readable label per artifact `kind` returned by the scanner.
+ *  MUST stay in sync with `ARTIFACT_RULES` in `src-tauri/src/plugin_fs.rs`. */
 const KIND_LABELS = {
   rust: "Rust (target)",
+  maven: "Maven (target)",
   node: "Node (node_modules)",
-  python: "Python (.venv / __pycache__)",
+  jscache: "JS cache (.next / .turbo / …)",
+  python: "Python (.venv / caches)",
   dotnet: ".NET (obj / bin)",
-  gradle: "Gradle (.gradle)",
+  gradle: "Gradle (build / .gradle)",
+  cmake: "CMake (build)",
+  swift: "Swift (.build / Pods)",
+  flutter: "Flutter (build / .dart_tool)",
+  terraform: "Terraform (.terraform)",
+  elixir: "Elixir (_build)",
+  zig: "Zig (zig-out / .zig-cache)",
+  haskell: "Haskell (.stack-work / dist-newstyle)",
+  php: "PHP (vendor)",
 };
 
 /** All kinds the scanner can emit — the default enabled set. */
-const ALL_KINDS = ["rust", "node", "python", "dotnet", "gradle"];
+const ALL_KINDS = Object.keys(KIND_LABELS);
 
 /**
  * Default configuration. Overridden by persisted config (config.json) merged on
@@ -44,7 +56,11 @@ const DEFAULTS = {
   totalWarnBytes: 50 * GIB, // total reclaimable → "warn"
   totalCriticalBytes: 150 * GIB, // total reclaimable → "critical"
   hotWindowSecs: 24 * HOUR_SECS, // artifacts built within this are excluded (active builds)
-  pollIntervalMs: 5 * 60 * 1000, // background threshold poll cadence (mirrors claudeUsage)
+  // Background threshold poll cadence. Each poll is a full stat-heavy walk of
+  // every repo (tens of seconds on big target/ trees), and reclaimable disk
+  // changes on a scale of days — 60min keeps the nag fresh at ~1% of the I/O
+  // cost of the old 5min default. Exposed in the settings form.
+  pollIntervalMs: 60 * 60 * 1000,
   enabledKinds: [...ALL_KINDS],
 };
 
@@ -143,13 +159,14 @@ function escapeHtml(str) {
     .replace(/"/g, "&quot;");
 }
 
-/** Config as GiB/hours for the settings form. Inverse of formToConfig. */
+/** Config as GiB/hours/minutes for the settings form. Inverse of formToConfig. */
 export function configToForm(cfg) {
   return {
     perArtifactWarnGiB: +(cfg.perArtifactWarnBytes / GIB).toFixed(1),
     totalWarnGiB: +(cfg.totalWarnBytes / GIB).toFixed(1),
     totalCriticalGiB: +(cfg.totalCriticalBytes / GIB).toFixed(1),
     hotWindowHours: +(cfg.hotWindowSecs / HOUR_SECS).toFixed(1),
+    pollIntervalMinutes: Math.round(cfg.pollIntervalMs / 60000),
     enabledKinds: [...cfg.enabledKinds],
   };
 }
@@ -166,6 +183,9 @@ export function formToConfig(form, base) {
     totalWarnBytes: pos(form.totalWarnGiB, base.totalWarnBytes / GIB) * GIB,
     totalCriticalBytes: pos(form.totalCriticalGiB, base.totalCriticalBytes / GIB) * GIB,
     hotWindowSecs: pos(form.hotWindowHours, base.hotWindowSecs / HOUR_SECS) * HOUR_SECS,
+    // Floor of 5 minutes — each poll is a full repo walk; anything faster is
+    // pure I/O waste and was the cause of the old ~10% duty cycle.
+    pollIntervalMs: Math.max(5, pos(form.pollIntervalMinutes, base.pollIntervalMs / 60000)) * 60000,
     enabledKinds: kinds.length ? kinds : [...ALL_KINDS],
   };
 }
@@ -174,15 +194,25 @@ export function formToConfig(form, base) {
  * Render the full dashboard HTML. Pure: given the same scan + config it returns
  * identical markup, so it can be unit-tested and diffed. Groups artifacts by
  * repo (largest repo first), totals in `.dash-stat` cards, one table per repo.
+ *
+ * `entries === null` means "no scan yet" — renders a scanning placeholder so
+ * the panel can open instantly while the (slow) walk runs. `opts.scanning`
+ * disables the Rescan button and relabels it while a scan is in flight.
  */
-export function buildPanelHtml(entries, cfg, nowSecs) {
+export function buildPanelHtml(entries, cfg, nowSecs, opts = {}) {
+  const scanning = opts.scanning === true || entries === null;
   const kinds = new Set(cfg.enabledKinds);
-  const visible = entries.filter((e) => kinds.has(e.kind));
-  const evalRes = evaluateThresholds(entries, cfg, nowSecs);
+  const visible = (entries || []).filter((e) => kinds.has(e.kind));
+  const evalRes = evaluateThresholds(entries || [], cfg, nowSecs);
   const form = configToForm(cfg);
 
-  const body = visible.length === 0 ? emptyState() : buildRepoSections(visible, cfg, nowSecs);
-  const stats = buildStatCards(visible, evalRes, cfg);
+  const body =
+    entries === null
+      ? `<div class="empty-state">Scanning repositories…</div>`
+      : visible.length === 0
+        ? emptyState()
+        : buildRepoSections(visible, cfg, nowSecs);
+  const stats = entries === null ? "" : buildStatCards(visible, evalRes, cfg);
   const settings = buildSettingsSection(form);
 
   return `<!DOCTYPE html>
@@ -192,13 +222,22 @@ export function buildPanelHtml(entries, cfg, nowSecs) {
   /* Plugin-specific tweaks only — layout/cards/tables come from PLUGIN_BASE_CSS. */
   .repo-total { color: var(--fg-secondary); font-weight: 500; }
   .badge-hot { color: var(--warning); border-color: var(--warning); }
+  /* Fixed layout + shared colgroup widths so columns line up ACROSS the
+     per-repo tables (auto layout sizes each table independently). */
+  table { table-layout: fixed; }
+  col.c-kind { width: 200px; }
+  col.c-size { width: 80px; }
+  col.c-age { width: 60px; }
+  col.c-action { width: 90px; }
+  td, th { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  td:first-child { white-space: normal; overflow-wrap: anywhere; }
   td.actions { text-align: right; white-space: nowrap; }
   button.danger {
     background: transparent; color: var(--error);
     border: 1px solid var(--border); border-radius: 4px;
     padding: 2px 10px; font-size: 11px; cursor: pointer;
   }
-  button.danger:hover { background: var(--error); color: var(--bg-primary); border-color: var(--error); }
+  button.danger:hover, button.danger.armed { background: var(--error); color: var(--bg-primary); border-color: var(--error); }
   button.danger:disabled { opacity: 0.5; cursor: default; background: transparent; color: var(--fg-muted); }
   details.settings { margin-top: 4px; }
   details.settings summary { cursor: pointer; color: var(--fg-secondary); font-size: 12px; }
@@ -216,7 +255,7 @@ export function buildPanelHtml(entries, cfg, nowSecs) {
 <div class="dashboard">
   <div class="dash-header">
     <h1 class="dash-title">Build Artifacts Cleaner</h1>
-    <button id="btn-refresh" class="primary">Rescan</button>
+    <button id="btn-refresh" class="primary"${scanning ? " disabled" : ""}>${scanning ? "Scanning…" : "Rescan"}</button>
   </div>
   ${stats}
   ${body}
@@ -227,11 +266,26 @@ export function buildPanelHtml(entries, cfg, nowSecs) {
 
   document.getElementById("btn-refresh").addEventListener("click", () => post({ action: "refresh" }));
 
+  // Two-step arm/confirm instead of a native confirm() dialog: the panel
+  // iframe sandbox has no allow-modals, so a modal would silently return
+  // false and the delete would never fire. First click arms the button,
+  // second click (within 4s) deletes; the arm auto-reverts otherwise.
   document.querySelectorAll("button.danger").forEach((btn) => {
+    let disarmTimer = null;
     btn.addEventListener("click", () => {
+      if (btn.dataset.armed !== "1") {
+        btn.dataset.armed = "1";
+        btn.classList.add("armed");
+        btn.textContent = "Sure?";
+        disarmTimer = setTimeout(() => {
+          btn.dataset.armed = "";
+          btn.classList.remove("armed");
+          btn.textContent = "Clean";
+        }, 4000);
+        return;
+      }
+      clearTimeout(disarmTimer);
       const path = btn.dataset.path;
-      const label = btn.dataset.label || path;
-      if (!window.confirm("Delete " + label + "?\\n\\nThis permanently removes the directory. It will be rebuilt on the next build.")) return;
       document.querySelectorAll('button.danger[data-path="' + CSS.escape(path) + '"]').forEach((b) => {
         b.disabled = true;
         b.textContent = "Deleting…";
@@ -252,6 +306,7 @@ export function buildPanelHtml(entries, cfg, nowSecs) {
           totalWarnGiB: num("cfg-totalWarn"),
           totalCriticalGiB: num("cfg-totalCritical"),
           hotWindowHours: num("cfg-hotWindow"),
+          pollIntervalMinutes: num("cfg-pollInterval"),
           enabledKinds,
         },
       });
@@ -312,7 +367,7 @@ function buildRepoSections(visible, cfg, nowSecs) {
             <td>${escapeHtml(kindLabel)}</td>
             <td class="num">${fmtBytes(e.size_bytes)}</td>
             <td class="num">${fmtAge(e.last_modified_secs, nowSecs)}</td>
-            <td class="actions"><button class="danger" data-path="${escapeHtml(e.path)}" data-label="${escapeHtml(relPath(e.path, repo))}">Clean</button></td>
+            <td class="actions"><button class="danger" data-path="${escapeHtml(e.path)}">Clean</button></td>
           </tr>`;
         })
         .join("");
@@ -320,6 +375,7 @@ function buildRepoSections(visible, cfg, nowSecs) {
       return `<div class="dash-section">
         <h2 class="dash-section-title">${escapeHtml(basename(repo))} <span class="repo-total">${fmtBytes(total)}</span></h2>
         <table>
+          <colgroup><col/><col class="c-kind"/><col class="c-size"/><col class="c-age"/><col class="c-action"/></colgroup>
           <thead><tr><th>Path</th><th>Kind</th><th class="num">Size</th><th class="num">Age</th><th class="num">Action</th></tr></thead>
           <tbody>${rows}</tbody>
         </table>
@@ -343,6 +399,7 @@ function buildSettingsSection(form) {
         ${numInput("cfg-hotWindow", "Hot-window exclude (hours)", form.hotWindowHours)}
         ${numInput("cfg-totalWarn", "Total warn (GiB)", form.totalWarnGiB)}
         ${numInput("cfg-totalCritical", "Total critical (GiB)", form.totalCriticalGiB)}
+        ${numInput("cfg-pollInterval", "Background scan every (minutes)", form.pollIntervalMinutes)}
       </div>
       <div class="kinds">${ALL_KINDS.map(kindCheckbox).join("")}</div>
       <div style="margin-top:12px"><button id="btn-save-config" class="primary">Save settings</button></div>
@@ -358,6 +415,10 @@ let hostRef = null;
 let panelHandle = null;
 let pollTimer = null;
 let config = { ...DEFAULTS };
+/** Last completed scan result (null until the first scan finishes). Lets the
+ *  dashboard open instantly with recent data instead of blocking on a walk
+ *  that can take tens of seconds on large target/ trees. */
+let lastEntries = null;
 
 /** Wall-clock seconds. Isolated so tests can inject a fixed clock. */
 function nowSecs() {
@@ -373,13 +434,14 @@ function repoPaths() {
 
 async function scan() {
   const paths = repoPaths();
-  if (paths.length === 0) return [];
+  if (paths.length === 0) return (lastEntries = []);
   try {
-    return await hostRef.scanBuildArtifacts(paths);
+    lastEntries = await hostRef.scanBuildArtifacts(paths);
   } catch (err) {
     hostRef.log("warn", `scan failed: ${err}`);
-    return [];
+    lastEntries = lastEntries || [];
   }
+  return lastEntries;
 }
 
 function renderPanel(entries) {
@@ -391,20 +453,24 @@ function renderPanel(entries) {
 }
 
 async function openDashboard() {
-  const entries = await scan();
-  const html = buildPanelHtml(entries, config, nowSecs());
+  // Open instantly with the last scan (or a scanning placeholder), then
+  // refresh in the background — the walk can take tens of seconds.
   panelHandle = hostRef.openPanel({
     id: PLUGIN_ID,
     title: "Build Cleaner",
-    html,
+    html: buildPanelHtml(lastEntries, config, nowSecs(), { scanning: true }),
     onMessage: handlePanelMessage,
   });
+  renderPanel(await scan());
 }
 
 async function handlePanelMessage(msg) {
   if (!msg || typeof msg !== "object") return;
 
   if (msg.action === "refresh") {
+    if (panelHandle) {
+      panelHandle.update(buildPanelHtml(lastEntries, config, nowSecs(), { scanning: true }));
+    }
     renderPanel(await scan());
     return;
   }
@@ -413,21 +479,24 @@ async function handlePanelMessage(msg) {
     try {
       await hostRef.deleteBuildArtifact(msg.path, repoPaths());
       hostRef.log("info", `deleted ${msg.path}`);
+      // Drop the entry from the cache instead of a full rescan (tens of
+      // seconds on large trees) — the background poll reconciles drift.
+      lastEntries = (lastEntries || []).filter((e) => e.path !== msg.path);
     } catch (err) {
       hostRef.log("error", `delete failed for ${msg.path}: ${err}`);
     }
-    const entries = await scan();
-    renderPanel(entries);
-    updateThresholdState(entries);
+    renderPanel(lastEntries || []);
+    updateThresholdState(lastEntries || []);
     return;
   }
 
   if (msg.action === "saveConfig" && msg.config) {
     config = formToConfig(msg.config, config);
     await saveConfig();
-    const entries = await scan();
-    renderPanel(entries);
-    updateThresholdState(entries);
+    startPollTimer(); // cadence may have changed
+    // No rescan needed — kind filtering and thresholds are applied at render.
+    renderPanel(lastEntries || []);
+    updateThresholdState(lastEntries || []);
   }
 }
 
@@ -473,6 +542,12 @@ function updateThresholdState(entries) {
 async function poll() {
   const entries = await scan();
   updateThresholdState(entries);
+}
+
+/** (Re)start the background poll with the current config's cadence. */
+function startPollTimer() {
+  if (pollTimer) clearInterval(pollTimer);
+  pollTimer = setInterval(poll, config.pollIntervalMs);
 }
 
 // ---------------------------------------------------------------------------
@@ -537,7 +612,7 @@ export default {
 
     // Initial scan + threshold check, then poll on the configured cadence.
     poll();
-    pollTimer = setInterval(poll, config.pollIntervalMs);
+    startPollTimer();
   },
 
   onunload() {
