@@ -1,5 +1,16 @@
 [
   {
+    "id": "docx-preview",
+    "name": "DOCX Preview",
+    "description": "Preview Microsoft Word .docx/.dotx files as clean HTML using Mammoth.js.",
+    "author": "sstraus",
+    "repo": "sstraus/tuicommander-plugins",
+    "latestVersion": "1.0.0",
+    "minAppVersion": "1.5.2",
+    "capabilities": ["ui:file-preview", "ui:panel", "fs:read"],
+    "downloadUrl": "https://github.com/sstraus/tuicommander-plugins/releases/latest/download/docx-preview.zip"
+  },
+  {
     "id": "mdkb-dashboard",
     "name": "mdkb Dashboard",
     "description": "View mdkb knowledge base status, collections, memories, and configuration in an interactive panel.",

@@ -1,0 +1,10 @@
+{
+  "id": "docx-preview",
+  "name": "DOCX Preview",
+  "version": "1.0.0",
+  "minAppVersion": "1.5.2",
+  "main": "main.js",
+  "description": "Preview Microsoft Word .docx/.dotx files as clean HTML using Mammoth.js.",
+  "author": "sstraus",
+  "capabilities": ["ui:file-preview", "ui:panel", "fs:read"]
+}
