@@ -414,6 +414,7 @@ function buildSettingsSection(form) {
 let hostRef = null;
 let panelHandle = null;
 let pollTimer = null;
+let lifecycleGeneration = 0;
 let config = { ...DEFAULTS };
 /** Last completed scan result (null until the first scan finishes). Lets the
  *  dashboard open instantly with recent data instead of blocking on a walk
@@ -425,20 +426,33 @@ function nowSecs() {
   return Math.floor(Date.now() / 1000);
 }
 
-function repoPaths() {
-  return hostRef
+function isCurrentLifecycle(host, generation) {
+  return hostRef === host && lifecycleGeneration === generation;
+}
+
+function repoPaths(host = hostRef) {
+  if (!host) return [];
+  return host
     .getRepos()
     .map((r) => r.path)
     .filter(Boolean);
 }
 
-async function scan() {
-  const paths = repoPaths();
-  if (paths.length === 0) return (lastEntries = []);
+async function scan(forceRefresh = false, host = hostRef, generation = lifecycleGeneration) {
+  if (!host) return null;
+  const paths = repoPaths(host);
+  if (paths.length === 0) {
+    if (!isCurrentLifecycle(host, generation)) return null;
+    lastEntries = [];
+    return lastEntries;
+  }
   try {
-    lastEntries = await hostRef.scanBuildArtifacts(paths);
+    const entries = await host.scanBuildArtifacts(paths, { forceRefresh });
+    if (!isCurrentLifecycle(host, generation)) return null;
+    lastEntries = entries;
   } catch (err) {
-    hostRef.log("warn", `scan failed: ${err}`);
+    if (!isCurrentLifecycle(host, generation)) return null;
+    host.log("warn", `scan failed: ${err}`);
     lastEntries = lastEntries || [];
   }
   return lastEntries;
@@ -453,37 +467,50 @@ function renderPanel(entries) {
 }
 
 async function openDashboard() {
+  const host = hostRef;
+  const generation = lifecycleGeneration;
+  if (!host) return;
   // Open instantly with the last scan (or a scanning placeholder), then
   // refresh in the background — the walk can take tens of seconds.
-  panelHandle = hostRef.openPanel({
+  panelHandle = host.openPanel({
     id: PLUGIN_ID,
     title: "Build Cleaner",
     html: buildPanelHtml(lastEntries, config, nowSecs(), { scanning: true }),
     onMessage: handlePanelMessage,
   });
-  renderPanel(await scan());
+  const entries = await scan(false, host, generation);
+  if (entries !== null && isCurrentLifecycle(host, generation)) renderPanel(entries);
 }
 
 async function handlePanelMessage(msg) {
   if (!msg || typeof msg !== "object") return;
 
   if (msg.action === "refresh") {
+    const host = hostRef;
+    const generation = lifecycleGeneration;
+    if (!host) return;
     if (panelHandle) {
       panelHandle.update(buildPanelHtml(lastEntries, config, nowSecs(), { scanning: true }));
     }
-    renderPanel(await scan());
+    const entries = await scan(true, host, generation);
+    if (entries !== null && isCurrentLifecycle(host, generation)) renderPanel(entries);
     return;
   }
 
   if (msg.action === "delete" && typeof msg.path === "string") {
+    const host = hostRef;
+    const generation = lifecycleGeneration;
+    if (!host) return;
     try {
-      await hostRef.deleteBuildArtifact(msg.path, repoPaths());
-      hostRef.log("info", `deleted ${msg.path}`);
+      await host.deleteBuildArtifact(msg.path, repoPaths(host));
+      if (!isCurrentLifecycle(host, generation)) return;
+      host.log("info", `deleted ${msg.path}`);
       // Drop the entry from the cache instead of a full rescan (tens of
       // seconds on large trees) — the background poll reconciles drift.
       lastEntries = (lastEntries || []).filter((e) => e.path !== msg.path);
     } catch (err) {
-      hostRef.log("error", `delete failed for ${msg.path}: ${err}`);
+      if (!isCurrentLifecycle(host, generation)) return;
+      host.log("error", `delete failed for ${msg.path}: ${err}`);
     }
     renderPanel(lastEntries || []);
     updateThresholdState(lastEntries || []);
@@ -491,8 +518,12 @@ async function handlePanelMessage(msg) {
   }
 
   if (msg.action === "saveConfig" && msg.config) {
+    const host = hostRef;
+    const generation = lifecycleGeneration;
+    if (!host) return;
     config = formToConfig(msg.config, config);
-    await saveConfig();
+    await saveConfig(host, generation);
+    if (!isCurrentLifecycle(host, generation)) return;
     startPollTimer(); // cadence may have changed
     // No rescan needed — kind filtering and thresholds are applied at render.
     renderPanel(lastEntries || []);
@@ -505,19 +536,20 @@ async function handlePanelMessage(msg) {
 // ---------------------------------------------------------------------------
 
 /** Ensure the Activity Center section exists, then apply/clear the bell + ticker. */
-function updateThresholdState(entries) {
+function updateThresholdState(entries, host = hostRef) {
+  if (!host) return;
   const res = evaluateThresholds(entries, config, nowSecs());
 
   if (res.severity === "none") {
-    hostRef.removeItem(BELL_ID);
-    hostRef.clearTicker(TICKER_ID);
+    host.removeItem(BELL_ID);
+    host.clearTicker(TICKER_ID);
     return;
   }
 
   const sizeStr = fmtBytes(res.totalBytes);
   const largestStr = res.largest ? `${fmtBytes(res.largest.size_bytes)} in ${basename(res.largest.repo)}` : "";
 
-  hostRef.addItem({
+  host.addItem({
     id: BELL_ID,
     pluginId: PLUGIN_ID,
     sectionId: SECTION_ID,
@@ -529,7 +561,7 @@ function updateThresholdState(entries) {
     onClick: () => openDashboard(),
   });
 
-  hostRef.setTicker({
+  host.setTicker({
     id: TICKER_ID,
     label: "Build",
     text: `${sizeStr} reclaimable`,
@@ -540,8 +572,12 @@ function updateThresholdState(entries) {
 }
 
 async function poll() {
-  const entries = await scan();
-  updateThresholdState(entries);
+  const host = hostRef;
+  const generation = lifecycleGeneration;
+  if (!host) return;
+  const entries = await scan(false, host, generation);
+  if (entries === null || !isCurrentLifecycle(host, generation)) return;
+  updateThresholdState(entries, host);
 }
 
 /** (Re)start the background poll with the current config's cadence. */
@@ -554,9 +590,10 @@ function startPollTimer() {
 // Config persistence
 // ---------------------------------------------------------------------------
 
-async function loadConfig() {
+async function loadConfig(host, generation) {
   try {
-    const raw = await hostRef.invoke("read_plugin_data", { pluginId: PLUGIN_ID, path: "config.json" });
+    const raw = await host.invoke("read_plugin_data", { pluginId: PLUGIN_ID, path: "config.json" });
+    if (!isCurrentLifecycle(host, generation)) return false;
     if (raw) {
       const parsed = JSON.parse(raw);
       config = { ...DEFAULTS, ...parsed };
@@ -569,19 +606,21 @@ async function loadConfig() {
       }
     }
   } catch {
+    if (!isCurrentLifecycle(host, generation)) return false;
     config = { ...DEFAULTS };
   }
+  return true;
 }
 
-async function saveConfig() {
+async function saveConfig(host, generation) {
   try {
-    await hostRef.invoke("write_plugin_data", {
+    await host.invoke("write_plugin_data", {
       pluginId: PLUGIN_ID,
       path: "config.json",
       content: JSON.stringify(config),
     });
   } catch (err) {
-    hostRef.log("warn", `config persist failed: ${err}`);
+    if (isCurrentLifecycle(host, generation)) host.log("warn", `config persist failed: ${err}`);
   }
 }
 
@@ -593,6 +632,7 @@ export default {
   id: PLUGIN_ID,
 
   async onload(host) {
+    const generation = ++lifecycleGeneration;
     hostRef = host;
 
     host.registerSection({
@@ -608,7 +648,7 @@ export default {
       open: () => openDashboard(),
     });
 
-    await loadConfig();
+    if (!(await loadConfig(host, generation))) return;
 
     // Initial scan + threshold check, then poll on the configured cadence.
     poll();
@@ -616,6 +656,7 @@ export default {
   },
 
   onunload() {
+    lifecycleGeneration += 1;
     if (pollTimer) {
       clearInterval(pollTimer);
       pollTimer = null;
