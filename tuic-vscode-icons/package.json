@@ -10,7 +10,7 @@
   "author": "",
   "license": "ISC",
   "devDependencies": {
-    "jsdom": "^29.0.1",
-    "svg-path-simplify": "^0.4.3"
+    "jsdom": "^29.1.1",
+    "svg-path-simplify": "^0.4.7"
   }
 }
