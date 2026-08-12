@@ -594,6 +594,12 @@ export default {
       session.choicePromptActive = true;
     });
 
+    host.registerStructuredEventHandler("choice-cleared", (_payload, sessionId) => {
+      const session = sessions.get(sessionId);
+      if (!session) return;
+      session.choicePromptActive = false;
+    });
+
     // ── Real user input — re-arms and clears question/choice state ──
     host.registerStructuredEventHandler("user-input", (payload, sessionId) => {
       const content = payload?.content ?? "";
