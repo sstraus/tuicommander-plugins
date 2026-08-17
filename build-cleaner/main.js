@@ -121,8 +121,13 @@ export function relPath(child, repo) {
  * a `target/` from a build 10 minutes ago is excluded so we don't pester during
  * active work. A single stale artifact ≥ perArtifactWarnBytes also trips "warn".
  *
+ * `trimmableBytes` is the share of `totalBytes` that a Trim would reclaim while
+ * leaving the built executables in place. It never drives a threshold — the nag
+ * is about disk, not about which action you take — it is reported so the
+ * dashboard can show how much of the total is safe to reclaim.
+ *
  * @returns {{severity:"none"|"warn"|"critical", totalBytes:number,
- *            staleCount:number, largest:object|null}}
+ *            trimmableBytes:number, staleCount:number, largest:object|null}}
  */
 export function evaluateThresholds(entries, cfg, nowSecs) {
   const kinds = new Set(cfg.enabledKinds);
@@ -130,6 +135,7 @@ export function evaluateThresholds(entries, cfg, nowSecs) {
     (e) => kinds.has(e.kind) && nowSecs - e.last_modified_secs >= cfg.hotWindowSecs,
   );
   const totalBytes = stale.reduce((s, e) => s + e.size_bytes, 0);
+  const trimmableBytes = stale.reduce((s, e) => s + (e.trimmable_bytes || 0), 0);
   const largest = stale.reduce((m, e) => (e.size_bytes > (m ? m.size_bytes : 0) ? e : m), null);
 
   let severity = "none";
@@ -141,7 +147,21 @@ export function evaluateThresholds(entries, cfg, nowSecs) {
   ) {
     severity = "warn";
   }
-  return { severity, totalBytes, staleCount: stale.length, largest };
+  return { severity, totalBytes, trimmableBytes, staleCount: stale.length, largest };
+}
+
+/**
+ * Reflect a completed clean/trim in the cached scan without re-walking the
+ * filesystem. A clean removes the entry; a trim keeps it — the executables are
+ * still on disk — and subtracts what the backend just reclaimed.
+ */
+export function applyRemoval(entries, path, trim) {
+  if (!trim) return entries.filter((e) => e.path !== path);
+  return entries.map((e) =>
+    e.path === path
+      ? { ...e, size_bytes: Math.max(0, e.size_bytes - e.trimmable_bytes), trimmable_bytes: 0 }
+      : e,
+  );
 }
 
 /** Ticker priority from severity — mirrors claudeUsage getTickerPriority tiers. */
@@ -228,17 +248,22 @@ export function buildPanelHtml(entries, cfg, nowSecs, opts = {}) {
   col.c-kind { width: 200px; }
   col.c-size { width: 80px; }
   col.c-age { width: 60px; }
-  col.c-action { width: 90px; }
+  col.c-action { width: 150px; }
   td, th { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   td:first-child { white-space: normal; overflow-wrap: anywhere; }
   td.actions { text-align: right; white-space: nowrap; }
-  button.danger {
-    background: transparent; color: var(--error);
+  /* Two risk tiers, colour-coded: .safe keeps the built executables, .danger
+     removes them too. Both arm before firing — a trim still costs a rebuild. */
+  button.safe, button.danger {
+    background: transparent;
     border: 1px solid var(--border); border-radius: 4px;
     padding: 2px 10px; font-size: 11px; cursor: pointer;
   }
+  button.safe { color: var(--fg-primary); }
+  button.danger { color: var(--error); }
+  button.safe:hover, button.safe.armed { background: var(--accent); color: var(--bg-primary); border-color: var(--accent); }
   button.danger:hover, button.danger.armed { background: var(--error); color: var(--bg-primary); border-color: var(--error); }
-  button.danger:disabled { opacity: 0.5; cursor: default; background: transparent; color: var(--fg-muted); }
+  button.safe:disabled, button.danger:disabled { opacity: 0.5; cursor: default; background: transparent; color: var(--fg-muted); }
   details.settings { margin-top: 4px; }
   details.settings summary { cursor: pointer; color: var(--fg-secondary); font-size: 12px; }
   .settings-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px 16px; margin-top: 10px; }
@@ -269,28 +294,36 @@ export function buildPanelHtml(entries, cfg, nowSecs, opts = {}) {
   // Two-step arm/confirm instead of a native confirm() dialog: the panel
   // iframe sandbox has no allow-modals, so a modal would silently return
   // false and the delete would never fire. First click arms the button,
-  // second click (within 4s) deletes; the arm auto-reverts otherwise.
-  document.querySelectorAll("button.danger").forEach((btn) => {
+  // second click (within 4s) fires; the arm auto-reverts otherwise.
+  // Trim arms too — it spares the executables but still costs a full rebuild.
+  const LABELS = {
+    trim: { idle: "Trim", armed: "Trim?", busy: "Trimming…" },
+    delete: { idle: "Clean", armed: "Delete all?", busy: "Deleting…" },
+  };
+  document.querySelectorAll("button[data-action]").forEach((btn) => {
+    const labels = LABELS[btn.dataset.action];
     let disarmTimer = null;
     btn.addEventListener("click", () => {
       if (btn.dataset.armed !== "1") {
         btn.dataset.armed = "1";
         btn.classList.add("armed");
-        btn.textContent = "Sure?";
+        btn.textContent = labels.armed;
         disarmTimer = setTimeout(() => {
           btn.dataset.armed = "";
           btn.classList.remove("armed");
-          btn.textContent = "Clean";
+          btn.textContent = labels.idle;
         }, 4000);
         return;
       }
       clearTimeout(disarmTimer);
       const path = btn.dataset.path;
-      document.querySelectorAll('button.danger[data-path="' + CSS.escape(path) + '"]').forEach((b) => {
+      // Disable BOTH actions for this row — the other one operates on a tree
+      // that is about to change under it.
+      document.querySelectorAll('button[data-path="' + CSS.escape(path) + '"]').forEach((b) => {
         b.disabled = true;
-        b.textContent = "Deleting…";
+        if (b === btn) b.textContent = labels.busy;
       });
-      post({ action: "delete", path });
+      post({ action: btn.dataset.action, path });
     });
   });
 
@@ -332,9 +365,10 @@ function buildStatCards(visible, evalRes, cfg) {
     `<div class="dash-stat"><div class="dash-stat-label">${label}</div><div class="dash-stat-value">${value}</div>${extra}</div>`;
 
   return `<div class="dash-section">
-    <h2 class="dash-section-title">Overview <span class="dash-section-hint">reclaimable excludes the last ${Math.round(cfg.hotWindowSecs / HOUR_SECS)}h</span></h2>
+    <h2 class="dash-section-title">Overview <span class="dash-section-hint">reclaimable excludes the last ${Math.round(cfg.hotWindowSecs / HOUR_SECS)}h · trim keeps the built executables</span></h2>
     <div class="dash-stat-grid">
       ${card("Reclaimable", fmtBytes(evalRes.totalBytes), meter)}
+      ${card("Safe to trim", fmtBytes(evalRes.trimmableBytes))}
       ${card("Total on disk", fmtBytes(totalAll))}
       ${card("Artifacts", String(visible.length))}
       ${card("Repos", String(repos))}
@@ -362,12 +396,19 @@ function buildRepoSections(visible, cfg, nowSecs) {
           const hot = nowSecs - e.last_modified_secs < cfg.hotWindowSecs;
           const hotBadge = hot ? ` <span class="badge badge-hot">recent</span>` : "";
           const kindLabel = KIND_LABELS[e.kind] || e.kind;
+          const path = escapeHtml(e.path);
+          // Trim is offered only when the backend found separable intermediates
+          // for this toolchain — node_modules/.venv report 0 and get Clean only.
+          const trimBtn = e.trimmable_bytes
+            ? `<button class="safe" data-action="trim" data-path="${path}">Trim</button> `
+            : "";
           return `<tr>
             <td><code>${escapeHtml(relPath(e.path, repo))}</code>${hotBadge}</td>
             <td>${escapeHtml(kindLabel)}</td>
             <td class="num">${fmtBytes(e.size_bytes)}</td>
+            <td class="num">${e.trimmable_bytes ? fmtBytes(e.trimmable_bytes) : "—"}</td>
             <td class="num">${fmtAge(e.last_modified_secs, nowSecs)}</td>
-            <td class="actions"><button class="danger" data-path="${escapeHtml(e.path)}">Clean</button></td>
+            <td class="actions">${trimBtn}<button class="danger" data-action="delete" data-path="${path}">Clean</button></td>
           </tr>`;
         })
         .join("");
@@ -375,8 +416,8 @@ function buildRepoSections(visible, cfg, nowSecs) {
       return `<div class="dash-section">
         <h2 class="dash-section-title">${escapeHtml(basename(repo))} <span class="repo-total">${fmtBytes(total)}</span></h2>
         <table>
-          <colgroup><col/><col class="c-kind"/><col class="c-size"/><col class="c-age"/><col class="c-action"/></colgroup>
-          <thead><tr><th>Path</th><th>Kind</th><th class="num">Size</th><th class="num">Age</th><th class="num">Action</th></tr></thead>
+          <colgroup><col/><col class="c-kind"/><col class="c-size"/><col class="c-size"/><col class="c-age"/><col class="c-action"/></colgroup>
+          <thead><tr><th>Path</th><th>Kind</th><th class="num">Size</th><th class="num">Trimmable</th><th class="num">Age</th><th class="num">Action</th></tr></thead>
           <tbody>${rows}</tbody>
         </table>
       </div>`;
@@ -497,20 +538,23 @@ async function handlePanelMessage(msg) {
     return;
   }
 
-  if (msg.action === "delete" && typeof msg.path === "string") {
+  if ((msg.action === "delete" || msg.action === "trim") && typeof msg.path === "string") {
     const host = hostRef;
     const generation = lifecycleGeneration;
     if (!host) return;
+    const trim = msg.action === "trim";
     try {
-      await host.deleteBuildArtifact(msg.path, repoPaths(host));
+      await (trim
+        ? host.trimBuildArtifact(msg.path, repoPaths(host))
+        : host.deleteBuildArtifact(msg.path, repoPaths(host)));
       if (!isCurrentLifecycle(host, generation)) return;
-      host.log("info", `deleted ${msg.path}`);
-      // Drop the entry from the cache instead of a full rescan (tens of
-      // seconds on large trees) — the background poll reconciles drift.
-      lastEntries = (lastEntries || []).filter((e) => e.path !== msg.path);
+      host.log("info", `${trim ? "trimmed" : "deleted"} ${msg.path}`);
+      // Patch the cache instead of a full rescan (tens of seconds on large
+      // trees) — the background poll reconciles any drift.
+      lastEntries = applyRemoval(lastEntries || [], msg.path, trim);
     } catch (err) {
       if (!isCurrentLifecycle(host, generation)) return;
-      host.log("error", `delete failed for ${msg.path}: ${err}`);
+      host.log("error", `${trim ? "trim" : "delete"} failed for ${msg.path}: ${err}`);
     }
     renderPanel(lastEntries || []);
     updateThresholdState(lastEntries || []);
