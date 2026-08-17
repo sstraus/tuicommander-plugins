@@ -153,13 +153,16 @@ export function evaluateThresholds(entries, cfg, nowSecs) {
 /**
  * Reflect a completed clean/trim in the cached scan without re-walking the
  * filesystem. A clean removes the entry; a trim keeps it — the executables are
- * still on disk — and subtracts what the backend just reclaimed.
+ * still on disk — and subtracts `reclaimedBytes`, which is what the backend
+ * measured as it deleted, not what the last scan estimated. A build between the
+ * scan and the trim moves that estimate, and subtracting it then publishes a
+ * total no measurement supports.
  */
-export function applyRemoval(entries, path, trim) {
+export function applyRemoval(entries, path, trim, reclaimedBytes = 0) {
   if (!trim) return entries.filter((e) => e.path !== path);
   return entries.map((e) =>
     e.path === path
-      ? { ...e, size_bytes: Math.max(0, e.size_bytes - e.trimmable_bytes), trimmable_bytes: 0 }
+      ? { ...e, size_bytes: Math.max(0, e.size_bytes - reclaimedBytes), trimmable_bytes: 0 }
       : e,
   );
 }
@@ -544,14 +547,15 @@ async function handlePanelMessage(msg) {
     if (!host) return;
     const trim = msg.action === "trim";
     try {
-      await (trim
-        ? host.trimBuildArtifact(msg.path, repoPaths(host))
-        : host.deleteBuildArtifact(msg.path, repoPaths(host)));
+      const reclaimed = trim
+        ? await host.trimBuildArtifact(msg.path, repoPaths(host))
+        : await host.deleteBuildArtifact(msg.path, repoPaths(host));
       if (!isCurrentLifecycle(host, generation)) return;
       host.log("info", `${trim ? "trimmed" : "deleted"} ${msg.path}`);
       // Patch the cache instead of a full rescan (tens of seconds on large
-      // trees) — the background poll reconciles any drift.
-      lastEntries = applyRemoval(lastEntries || [], msg.path, trim);
+      // trees) — the background poll reconciles any drift. A trim reports the
+      // bytes it actually removed; anything else would be an invented total.
+      lastEntries = applyRemoval(lastEntries || [], msg.path, trim, Number(reclaimed) || 0);
     } catch (err) {
       if (!isCurrentLifecycle(host, generation)) return;
       host.log("error", `${trim ? "trim" : "delete"} failed for ${msg.path}: ${err}`);
