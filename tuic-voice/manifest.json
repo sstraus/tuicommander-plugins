@@ -1,0 +1,10 @@
+{
+  "id": "tuic-voice",
+  "name": "Voice",
+  "version": "1.0.0",
+  "minAppVersion": "1.0.5",
+  "main": "main.js",
+  "description": "Reads an agent's prose aloud while it streams, skipping tool calls, diffs and terminal chrome.",
+  "author": "TUICommander",
+  "capabilities": ["pty:read", "ui:context-menu", "ui:panel"]
+}
