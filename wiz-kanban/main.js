@@ -116,52 +116,64 @@ function hasWorkLog(content) {
 
 // ── Data loading ────────────────────────────────────────────────────────
 
-async function loadStories() {
-  if (!hostRef || !storiesDir) return [];
+// The host rejects a batch above 1000 paths outright. Chunking below that keeps
+// a big repo rendering instead of falling off a cliff into an empty board, and
+// is still nothing like the one-IPC-per-file it replaced.
+const READ_CHUNK = 500;
 
-  let files;
+/**
+ * List a directory and read every entry in as few host calls as possible.
+ *
+ * A board refresh used to cost one IPC per file; the whole directory now costs
+ * one list plus one read per 500 files. Files that could not be read are
+ * dropped, the same way the per-file reads used to swallow their own errors.
+ */
+async function loadDirContents(dir, pattern = "*.md") {
+  if (!hostRef) return [];
   try {
-    files = await hostRef.listDirectory(storiesDir, "*.md");
+    const filenames = await hostRef.listDirectory(dir, pattern);
+    const entries = [];
+    for (let i = 0; i < filenames.length; i += READ_CHUNK) {
+      const chunk = filenames.slice(i, i + READ_CHUNK);
+      const contents = await hostRef.readFiles(chunk.map((name) => `${dir}/${name}`));
+      for (let j = 0; j < chunk.length; j++) {
+        if (contents[j] != null) entries.push({ filename: chunk[j], content: contents[j] });
+      }
+    }
+    return entries;
   } catch {
     return [];
   }
+}
 
-  const BATCH_SIZE = 20;
-  const results = [];
+async function loadStories() {
+  if (!storiesDir) return [];
 
-  for (let i = 0; i < files.length; i += BATCH_SIZE) {
-    const batch = files.slice(i, i + BATCH_SIZE);
-    const batchResults = await Promise.all(
-      batch.map(async (filename) => {
-        const parsed = parseFilename(filename);
-        if (!parsed) return null;
+  const files = await loadDirContents(storiesDir);
 
-        try {
-          const content = await hostRef.readFile(`${storiesDir}/${filename}`);
-          const fm = parseFrontmatter(content);
-          if (!fm) return null;
+  return files
+    .map(({ filename, content }) => {
+      const parsed = parseFilename(filename);
+      if (!parsed) return null;
 
-          return {
-            id: fm.id || `${parsed.seq}-${parsed.hash}`,
-            seq: parsed.seq,
-            title: fm.title || parsed.slug.replace(/-/g, " "),
-            status: fm.status || parsed.status,
-            priority: fm.priority || parsed.priority,
-            filename,
-            hasWorkLog: hasWorkLog(content),
-            created: fm.created,
-            updated: fm.updated,
-            dependencies: fm.dependencies || [],
-          };
-        } catch {
-          return null;
-        }
-      }),
-    );
-    results.push(...batchResults);
-  }
+      const fm = parseFrontmatter(content);
+      if (!fm) return null;
 
-  return results.filter(Boolean).sort((a, b) => a.seq - b.seq);
+      return {
+        id: fm.id || `${parsed.seq}-${parsed.hash}`,
+        seq: parsed.seq,
+        title: fm.title || parsed.slug.replace(/-/g, " "),
+        status: fm.status || parsed.status,
+        priority: fm.priority || parsed.priority,
+        filename,
+        hasWorkLog: hasWorkLog(content),
+        created: fm.created,
+        updated: fm.updated,
+        dependencies: fm.dependencies || [],
+      };
+    })
+    .filter(Boolean)
+    .sort((a, b) => a.seq - b.seq);
 }
 
 // ── HTML rendering ──────────────────────────────────────────────────────
@@ -874,78 +886,42 @@ async function loadListItems(subdir) {
  * 3 kanban columns (planning / active / done).
  */
 async function loadPlans() {
-  if (!hostRef || !repoRoot) return [];
-  const dir = `${repoRoot}/plans`;
-  let files;
-  try {
-    files = await hostRef.listDirectory(dir, "*.md");
-  } catch {
-    return [];
-  }
+  if (!repoRoot) return [];
 
-  const BATCH_SIZE = 20;
-  const results = [];
-  for (let i = 0; i < files.length; i += BATCH_SIZE) {
-    const batch = files.slice(i, i + BATCH_SIZE);
-    const batchResults = await Promise.all(
-      batch.map(async (filename) => {
-        try {
-          const content = await hostRef.readFile(`${dir}/${filename}`);
-          const fm = parseFrontmatter(content);
-          const rawStatus = (fm && fm.status) || "";
-          const column = PLAN_STATUS_TO_COLUMN[rawStatus] || PLAN_FALLBACK_COLUMN;
-          return {
-            filename,
-            displayName: filename.replace(/\.md$/, ""),
-            rawStatus: rawStatus || "draft",
-            column,
-          };
-        } catch {
-          return null;
-        }
-      }),
-    );
-    results.push(...batchResults);
-  }
-  return results.filter(Boolean).sort((a, b) => a.displayName.localeCompare(b.displayName));
+  const files = await loadDirContents(`${repoRoot}/plans`);
+
+  return files
+    .map(({ filename, content }) => {
+      const fm = parseFrontmatter(content);
+      const rawStatus = (fm && fm.status) || "";
+      return {
+        filename,
+        displayName: filename.replace(/\.md$/, ""),
+        rawStatus: rawStatus || "draft",
+        column: PLAN_STATUS_TO_COLUMN[rawStatus] || PLAN_FALLBACK_COLUMN,
+      };
+    })
+    .sort((a, b) => a.displayName.localeCompare(b.displayName));
 }
 
 /** Load reviews with their frontmatter status. */
 async function loadReviews() {
-  if (!hostRef || !repoRoot) return [];
-  const dir = `${repoRoot}/reviews`;
-  let files;
-  try {
-    files = await hostRef.listDirectory(dir, "*.md");
-  } catch {
-    return [];
-  }
+  if (!repoRoot) return [];
 
-  const BATCH_SIZE = 20;
-  const results = [];
-  for (let i = 0; i < files.length; i += BATCH_SIZE) {
-    const batch = files.slice(i, i + BATCH_SIZE);
-    const batchResults = await Promise.all(
-      batch.map(async (filename) => {
-        try {
-          const content = await hostRef.readFile(`${dir}/${filename}`);
-          const fm = parseFrontmatter(content);
-          const rawStatus = (fm && fm.status) || "";
-          const column = REVIEW_COLUMNS.includes(rawStatus) ? rawStatus : REVIEW_FALLBACK_COLUMN;
-          return {
-            filename,
-            displayName: filename.replace(/\.md$/, ""),
-            rawStatus: rawStatus || "open",
-            column,
-          };
-        } catch {
-          return null;
-        }
-      }),
-    );
-    results.push(...batchResults);
-  }
-  return results.filter(Boolean).sort((a, b) => b.displayName.localeCompare(a.displayName));
+  const files = await loadDirContents(`${repoRoot}/reviews`);
+
+  return files
+    .map(({ filename, content }) => {
+      const fm = parseFrontmatter(content);
+      const rawStatus = (fm && fm.status) || "";
+      return {
+        filename,
+        displayName: filename.replace(/\.md$/, ""),
+        rawStatus: rawStatus || "open",
+        column: REVIEW_COLUMNS.includes(rawStatus) ? rawStatus : REVIEW_FALLBACK_COLUMN,
+      };
+    })
+    .sort((a, b) => b.displayName.localeCompare(a.displayName));
 }
 
 function renderPlanCard(plan) {
@@ -1100,23 +1076,45 @@ async function renderCurrentView() {
   return renderList(listItems, filters);
 }
 
-async function openKanban() {
+/** Point the board at the active repo. False when there is none. */
+function bindActiveRepo() {
   const repo = hostRef.getActiveRepo();
-  if (!repo) return;
-
+  if (!repo) return false;
   repoRoot = repo.path;
   storiesDir = `${repo.path}/${STORIES_DIR}`;
+  return true;
+}
+
+async function openKanban() {
+  if (!bindActiveRepo()) return;
 
   const html = await renderCurrentView();
 
+  refreshPending = false;
   panelHandle = hostRef.openPanel({
     id: "kanban-board",
     title: "Wiz Kanban",
     html,
     onMessage: handlePanelMessage,
+    onVisibilityChange: handlePanelVisibility,
+    onClose: handlePanelClose,
   });
 
   await startWatching();
+}
+
+/**
+ * Follow the active repo without touching a panel the user cannot see.
+ *
+ * Reopening through openKanban would render the new repo's board and pull the
+ * tab back to the front, both behind the user's back. refreshBoard does neither
+ * while hidden — it just records that the board is stale.
+ */
+async function rebindRepo() {
+  if (!bindActiveRepo()) return;
+  refreshPending = true;
+  await startWatching();
+  await refreshBoard();
 }
 
 async function dirExists() {
@@ -1128,10 +1126,46 @@ async function dirExists() {
   }
 }
 
+/** Set while the board went stale behind a hidden panel. */
+let refreshPending = false;
+
 async function refreshBoard() {
   if (!panelHandle || !repoRoot) return;
+
+  // Rebuilding a board nobody is looking at costs a directory read and a full
+  // re-render for nothing. Remember that it went stale and catch up on re-show.
+  if (!panelHandle.isVisible()) {
+    refreshPending = true;
+    return;
+  }
+
+  refreshPending = false;
   const html = await renderCurrentView();
-  panelHandle.update(html);
+
+  // Re-check: the read above is asynchronous, and the user may have switched
+  // away during it. Writing srcdoc replaces the iframe's document, so a late
+  // write into a now-hidden panel is not free.
+  if (!panelHandle || !panelHandle.isVisible()) {
+    refreshPending = true;
+    return;
+  }
+
+  if (!panelHandle.update(html)) handlePanelClose();
+}
+
+/** Catch up on the changes the panel missed while it was hidden. */
+function handlePanelVisibility(visible) {
+  if (visible && refreshPending) refreshBoard();
+}
+
+/**
+ * The tab is gone for good. Drop the handle and release the watch — a hidden
+ * panel comes back and is worth keeping state for, a closed one does not.
+ */
+function handlePanelClose() {
+  panelHandle = null;
+  refreshPending = false;
+  stopWatching();
 }
 
 function handlePanelMessage(data) {
@@ -1302,7 +1336,7 @@ export default {
         storiesDir = null;
         repoRoot = null;
         if (panelHandle) {
-          openKanban();
+          rebindRepo();
         }
       }
     });
@@ -1312,6 +1346,7 @@ export default {
 
   onunload() {
     stopWatching();
+    refreshPending = false;
     panelHandle = null;
     hostRef = null;
     stories = [];
