@@ -497,17 +497,14 @@ function summarizeResult(cmdId, out) {
 // Panel lifecycle
 // ---------------------------------------------------------------------------
 
+/**
+ * Push a render into the open panel. update() returns false once the user has
+ * closed the tab; that decision sticks, so we drop the handle instead of
+ * re-opening a panel nobody asked for.
+ */
 function renderPanel(data, repoPath, opts = {}) {
-  const html = renderDashboard(data, repoPath, opts);
-  if (panelRef) {
-    try {
-      panelRef.update(html);
-      return;
-    } catch {
-      // Panel closed — fall through to re-open.
-    }
-  }
-  panelRef = hostRef.openPanel({ id: "mdkb-dash", title: "mdkb", html, onMessage: handlePanelMessage });
+  if (!panelRef) return;
+  if (!panelRef.update(renderDashboard(data, repoPath, opts))) panelRef = null;
 }
 
 async function handlePanelMessage(msg) {
@@ -528,8 +525,9 @@ async function openDashboard(host) {
         </div>
       </div>
     `);
-    if (panelRef) panelRef.update(html);
-    else panelRef = host.openPanel({ id: "mdkb-dash", title: "mdkb", html, onMessage: handlePanelMessage });
+    // openPanel reuses and activates the panel with this id when one is open,
+    // so the user always ends up looking at it — no update/re-open dance.
+    panelRef = host.openPanel({ id: "mdkb-dash", title: "mdkb", html, onMessage: handlePanelMessage });
     return;
   }
 
@@ -537,12 +535,7 @@ async function openDashboard(host) {
   const loading = buildPage(repo.displayName, null, `
     <div class="dash-section"><div class="empty-state">Loading mdkb data for ${esc(repo.displayName)}…</div></div>
   `);
-  if (panelRef) {
-    try { panelRef.update(loading); } catch { panelRef = null; }
-  }
-  if (!panelRef) {
-    panelRef = host.openPanel({ id: "mdkb-dash", title: "mdkb", html: loading, onMessage: handlePanelMessage });
-  }
+  panelRef = host.openPanel({ id: "mdkb-dash", title: "mdkb", html: loading, onMessage: handlePanelMessage });
 
   lastData = await fetchMdkbData(host, repo.path);
   renderPanel(lastData, repo.path);
