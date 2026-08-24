@@ -1,5 +1,17 @@
 [
   {
+    "id": "at-capacity-retry",
+    "name": "At-Capacity Retry",
+    "description": "Retries a Codex turn that failed with \"Selected model is at capacity\". Waits 1 minute, then sends \"retry last request\". Blocks after more than 3 retries in one hour.",
+    "author": "sstraus",
+    "repo": "sstraus/tuicommander-plugins",
+    "latestVersion": "1.0.0",
+    "minAppVersion": "0.9.8",
+    "capabilities": ["pty:write", "pty:read", "ui:ticker", "ui:markdown", "ui:sound"],
+    "agentTypes": ["codex"],
+    "downloadUrl": "https://github.com/sstraus/tuicommander-plugins/releases/latest/download/at-capacity-retry.zip"
+  },
+  {
     "id": "docx-preview",
     "name": "DOCX Preview",
     "description": "Preview Microsoft Word .docx/.dotx files as clean HTML using Mammoth.js.",
@@ -31,6 +43,17 @@
     "minAppVersion": "0.9.8",
     "capabilities": ["ui:file-icons"],
     "downloadUrl": "https://github.com/sstraus/tuicommander-plugins/releases/latest/download/tuic-vscode-icons.zip"
+  },
+  {
+    "id": "tuic-voice",
+    "name": "Voice",
+    "description": "Reads an agent's prose aloud while it streams, skipping tool calls, diffs and terminal chrome. Uses the WebView's own speech synthesis — no model, no download.",
+    "author": "sstraus",
+    "repo": "sstraus/tuicommander-plugins",
+    "latestVersion": "1.0.0",
+    "minAppVersion": "1.0.5",
+    "capabilities": ["pty:read", "ui:context-menu", "ui:panel"],
+    "downloadUrl": "https://github.com/sstraus/tuicommander-plugins/releases/latest/download/tuic-voice.zip"
   },
   {
     "id": "cache-keepalive",
@@ -73,8 +96,8 @@
     "description": "Wiz framework plugin that visualizes a kanban board for managing the workflow of plans, stories, and reviews.",
     "author": "sstraus",
     "repo": "sstraus/tuicommander-plugins",
-    "latestVersion": "2.0.0",
-    "minAppVersion": "0.5.0",
+    "latestVersion": "2.1.0",
+    "minAppVersion": "1.7.5",
     "capabilities": ["fs:read", "fs:list", "fs:watch", "fs:write", "fs:rename", "ui:panel", "ui:markdown", "pty:write", "ui:context-menu"],
     "downloadUrl": "https://github.com/sstraus/tuicommander-plugins/releases/latest/download/wiz-kanban.zip"
   }

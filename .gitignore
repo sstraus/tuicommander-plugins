@@ -1,5 +1,8 @@
 .claude/
+.wiz/
 dist/
 node_modules/
+at-capacity-retry/data/
 cache-keepalive/data/
 claude-wakeup/data/
+tuic-voice/data/
