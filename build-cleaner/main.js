@@ -56,10 +56,11 @@ const DEFAULTS = {
   totalWarnBytes: 50 * GIB, // total reclaimable → "warn"
   totalCriticalBytes: 150 * GIB, // total reclaimable → "critical"
   hotWindowSecs: 24 * HOUR_SECS, // artifacts built within this are excluded (active builds)
-  // Background threshold poll cadence. Each poll is a full stat-heavy walk of
-  // every repo (tens of seconds on big target/ trees), and reclaimable disk
-  // changes on a scale of days — 60min keeps the nag fresh at ~1% of the I/O
-  // cost of the old 5min default. Exposed in the settings form.
+  // Rescan cadence WHILE THE DASHBOARD IS OPEN. Each poll is a full stat-heavy
+  // walk of every repo (tens of seconds on big target/ trees), so it only runs
+  // when someone is looking at the result — see startPollTimer. Reclaimable
+  // disk changes on a scale of days, so 60min is plenty. Exposed in the
+  // settings form.
   pollIntervalMs: 60 * 60 * 1000,
   enabledKinds: [...ALL_KINDS],
 };
@@ -443,7 +444,7 @@ function buildSettingsSection(form) {
         ${numInput("cfg-hotWindow", "Hot-window exclude (hours)", form.hotWindowHours)}
         ${numInput("cfg-totalWarn", "Total warn (GiB)", form.totalWarnGiB)}
         ${numInput("cfg-totalCritical", "Total critical (GiB)", form.totalCriticalGiB)}
-        ${numInput("cfg-pollInterval", "Background scan every (minutes)", form.pollIntervalMinutes)}
+        ${numInput("cfg-pollInterval", "Rescan while open every (minutes)", form.pollIntervalMinutes)}
       </div>
       <div class="kinds">${ALL_KINDS.map(kindCheckbox).join("")}</div>
       <div style="margin-top:12px"><button id="btn-save-config" class="primary">Save settings</button></div>
@@ -458,6 +459,10 @@ function buildSettingsSection(form) {
 let hostRef = null;
 let panelHandle = null;
 let pollTimer = null;
+/** True only while the dashboard panel is open AND on screen. The background
+ *  walk is expensive (seconds of fs traversal across every registered repo), so
+ *  it is gated on this — see startPollTimer. */
+let panelVisible = false;
 let lifecycleGeneration = 0;
 let config = { ...DEFAULTS };
 /** Last completed scan result (null until the first scan finishes). Lets the
@@ -521,7 +526,17 @@ async function openDashboard() {
     title: "Build Cleaner",
     html: buildPanelHtml(lastEntries, config, nowSecs(), { scanning: true }),
     onMessage: handlePanelMessage,
+    onVisibilityChange: (visible) => {
+      if (!isCurrentLifecycle(host, generation)) return;
+      setPanelVisible(visible);
+    },
+    onClose: () => {
+      if (!isCurrentLifecycle(host, generation)) return;
+      panelHandle = null;
+      setPanelVisible(false);
+    },
   });
+  setPanelVisible(true);
   const entries = await scan(false, host, generation);
   if (entries !== null && isCurrentLifecycle(host, generation)) renderPanel(entries);
 }
@@ -625,13 +640,35 @@ async function poll() {
   if (!host) return;
   const entries = await scan(false, host, generation);
   if (entries === null || !isCurrentLifecycle(host, generation)) return;
+  // DEFERRED (2026-08-18) — a walk already inside host.scanBuildArtifacts cannot
+  // be cancelled when the panel is hidden mid-scan; the host exposes no abort.
+  // The result is still applied here because it is fresh and correct.
+  if (panelVisible) renderPanel(entries);
   updateThresholdState(entries, host);
 }
 
-/** (Re)start the background poll with the current config's cadence. */
-function startPollTimer() {
+function stopPollTimer() {
   if (pollTimer) clearInterval(pollTimer);
+  pollTimer = null;
+}
+
+/** (Re)start the background poll with the current config's cadence — but only
+ *  while something consumes its output. A poll cycle walks every registered
+ *  repo (seconds of traversal, tens of GiB stat'd) and its only outputs are the
+ *  bell item and the ticker, so running it against a closed panel spends that
+ *  walk on nobody. The single startup scan in onload seeds the bell for a user
+ *  who never opens the dashboard; from then on the cadence follows the panel.
+ *  This is the ONLY place that decides whether the timer runs. */
+function startPollTimer() {
+  stopPollTimer();
+  if (!panelVisible) return;
   pollTimer = setInterval(poll, config.pollIntervalMs);
+}
+
+/** Panel open/close/visibility is the demand signal for the poll. */
+function setPanelVisible(visible) {
+  panelVisible = visible;
+  startPollTimer();
 }
 
 // ---------------------------------------------------------------------------
@@ -698,17 +735,15 @@ export default {
 
     if (!(await loadConfig(host, generation))) return;
 
-    // Initial scan + threshold check, then poll on the configured cadence.
+    // One scan at startup seeds the bell and ticker. There is no recurring poll
+    // until the dashboard is actually on screen — openDashboard starts it.
     poll();
-    startPollTimer();
   },
 
   onunload() {
     lifecycleGeneration += 1;
-    if (pollTimer) {
-      clearInterval(pollTimer);
-      pollTimer = null;
-    }
+    panelVisible = false;
+    stopPollTimer();
     hostRef?.clearTicker(TICKER_ID);
     hostRef?.removeItem(BELL_ID);
     panelHandle = null;
