@@ -1,0 +1,11 @@
+{
+  "id": "at-capacity-retry",
+  "name": "At-Capacity Retry",
+  "version": "1.0.0",
+  "minAppVersion": "0.9.8",
+  "main": "main.js",
+  "description": "Retries a Codex turn that failed with \"Selected model is at capacity\". Waits 1 minute, then sends `retry last request`. A circuit breaker stops the plugin after more than 3 retries in one hour.",
+  "author": "TUICommander",
+  "capabilities": ["pty:write", "pty:read", "ui:ticker", "ui:markdown", "ui:sound"],
+  "agentTypes": ["codex"]
+}
