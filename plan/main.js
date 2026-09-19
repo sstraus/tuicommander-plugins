@@ -50,8 +50,13 @@ async function openActivePlan(repoPath) {
       const parsed = JSON.parse(await hostRef.readFile(marker));
       if (!parsed || typeof parsed.path !== "string") continue;
       const absolutePath = isAbsolutePath(parsed.path) ? parsed.path : joinPath(repoPath, parsed.path);
-      knownPlans.add(absolutePath);
-      hostRef.openMarkdownFileBackground(absolutePath);
+      // Open once per path, like the other two entry points. This runs on every
+      // repo switch, so opening unconditionally re-created a tab the user had
+      // closed every time they came back to the repo.
+      if (!knownPlans.has(absolutePath)) {
+        knownPlans.add(absolutePath);
+        hostRef.openMarkdownFileBackground(absolutePath);
+      }
       return;
     } catch (error) {
       if (!isMissing(error) && !(error instanceof SyntaxError)) {

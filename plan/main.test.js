@@ -98,3 +98,22 @@ test("disposes a stale watch created during a rapid repo switch", async (t) => {
   assert.equal(stale.disposed, true);
   assert.equal(current.disposed, false);
 });
+
+test("does not reopen a closed active plan when the repo is re-entered", async (t) => {
+  const host = makeHost();
+  host.files.set("/repo/.claude/active-plan.json", JSON.stringify({ path: "plans/active.md" }));
+  plugin.onload(host);
+  t.after(() => plugin.onunload());
+  await settle();
+  assert.deepEqual(host.opened, ["/repo/plans/active.md"]);
+
+  // The user closes the tab, leaves the repo and comes back.
+  host.repoPath = "/other";
+  host.stateHandlers[0]({ type: "repo-changed" });
+  await settle();
+  host.repoPath = "/repo";
+  host.stateHandlers[0]({ type: "repo-changed" });
+  await settle();
+
+  assert.deepEqual(host.opened, ["/repo/plans/active.md"]);
+});
