@@ -11,6 +11,7 @@ Community plugin registry and distributable plugins for [TUICommander](https://g
 | [docx-preview](docx-preview/) | Preview Word `.docx`/`.dotx` files as clean HTML with Mammoth.js | `ui:file-preview`, `ui:panel`, `fs:read` |
 | [mdkb-dashboard](mdkb-dashboard/) | mdkb knowledge base status, memories, config | `exec:cli`, `fs:read`, `ui:panel`, `ui:ticker` |
 | [plan](plan/) | Tracks agent plan files and opens active plans in background tabs | `fs:read`, `fs:list`, `fs:watch`, `ui:markdown` |
+| [sqlite-viewer](sqlite-viewer/) | Inspect, filter, explain, and safely edit SQLite databases in self-contained WebAssembly | `ui:file-preview`, `ui:panel`, `fs:read`, `fs:write` |
 | [stories-ticker](stories-ticker/) | Shows the active repository's open story count | `fs:list`, `fs:watch`, `ui:ticker` |
 | [tuic-vscode-icons](tuic-vscode-icons/) | 1500+ file and folder icons from vscode-icons | `ui:file-icons` |
 | [tuic-voice](tuic-voice/) | Reads an agent's prose aloud while it streams, skipping tool calls, diffs and terminal chrome | `pty:read`, `ui:context-menu`, `ui:panel` |

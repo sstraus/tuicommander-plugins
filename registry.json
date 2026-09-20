@@ -133,5 +133,16 @@
     "minAppVersion": "1.7.7",
     "capabilities": ["fs:list", "fs:watch", "ui:ticker"],
     "downloadUrl": "https://github.com/sstraus/tuicommander-plugins/releases/latest/download/stories-ticker.zip"
+  },
+  {
+    "id": "sqlite-viewer",
+    "name": "SQLite Viewer",
+    "description": "Inspect, filter, query, explain, and safely edit SQLite databases using a bundled WebAssembly engine.",
+    "author": "sstraus",
+    "repo": "sstraus/tuicommander-plugins",
+    "latestVersion": "1.0.0",
+    "minAppVersion": "1.7.7",
+    "capabilities": ["ui:file-preview", "ui:panel", "fs:read", "fs:write"],
+    "downloadUrl": "https://github.com/sstraus/tuicommander-plugins/releases/latest/download/sqlite-viewer.zip"
   }
 ]
