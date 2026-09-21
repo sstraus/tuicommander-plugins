@@ -56,17 +56,6 @@
     "downloadUrl": "https://github.com/sstraus/tuicommander-plugins/releases/latest/download/tuic-vscode-icons.zip"
   },
   {
-    "id": "tuic-voice",
-    "name": "Voice",
-    "description": "Reads an agent's prose aloud while it streams, skipping tool calls, diffs and terminal chrome. Uses the WebView's own speech synthesis — no model, no download.",
-    "author": "sstraus",
-    "repo": "sstraus/tuicommander-plugins",
-    "latestVersion": "1.0.0",
-    "minAppVersion": "1.0.5",
-    "capabilities": ["pty:read", "ui:context-menu", "ui:panel"],
-    "downloadUrl": "https://github.com/sstraus/tuicommander-plugins/releases/latest/download/tuic-voice.zip"
-  },
-  {
     "id": "cache-keepalive",
     "name": "Cache Keepalive",
     "description": "Prevents Claude API prompt cache expiry by sending minimal keepalive messages during idle periods.",

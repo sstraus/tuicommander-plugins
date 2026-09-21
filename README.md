@@ -14,9 +14,11 @@ Community plugin registry and distributable plugins for [TUICommander](https://g
 | [sqlite-viewer](sqlite-viewer/) | Inspect, filter, explain, and safely edit SQLite databases in self-contained WebAssembly | `ui:file-preview`, `ui:panel`, `fs:read`, `fs:write` |
 | [stories-ticker](stories-ticker/) | Shows the active repository's open story count | `fs:list`, `fs:watch`, `ui:ticker` |
 | [tuic-vscode-icons](tuic-vscode-icons/) | 1500+ file and folder icons from vscode-icons | `ui:file-icons` |
-| [tuic-voice](tuic-voice/) | Reads an agent's prose aloud while it streams, skipping tool calls, diffs and terminal chrome | `pty:read`, `ui:context-menu`, `ui:panel` |
 | [wiz-kanban](wiz-kanban/) | Wiz framework workflow kanban for plans, stories, and reviews | `fs:read`, `fs:write`, `ui:panel`, `pty:write` |
 | [xlsx-preview](xlsx-preview/) | Preview Excel `.xlsx`/`.xlsm`/`.xlsb`/`.xls` and OpenDocument `.ods` spreadsheets as sortable tables with SheetJS | `ui:file-preview`, `ui:panel`, `fs:read` |
+
+The former Voice plugin has been retired. Native Kokoro voice conversation is
+planned in TUICommander’s Dictation settings; it is not available from this registry.
 
 ## registry.json
 
