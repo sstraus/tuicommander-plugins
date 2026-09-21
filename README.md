@@ -17,8 +17,8 @@ Community plugin registry and distributable plugins for [TUICommander](https://g
 | [wiz-kanban](wiz-kanban/) | Wiz framework workflow kanban for plans, stories, and reviews | `fs:read`, `fs:write`, `ui:panel`, `pty:write` |
 | [xlsx-preview](xlsx-preview/) | Preview Excel `.xlsx`/`.xlsm`/`.xlsb`/`.xls` and OpenDocument `.ods` spreadsheets as sortable tables with SheetJS | `ui:file-preview`, `ui:panel`, `fs:read` |
 
-The former Voice plugin has been retired. Native Kokoro voice conversation is
-planned in TUICommander’s Dictation settings; it is not available from this registry.
+The former Voice plugin has been retired. Native voice conversation is planned
+in TUICommander’s Dictation settings; it is not available from this registry.
 
 ## registry.json
 
