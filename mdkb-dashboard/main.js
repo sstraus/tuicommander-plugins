@@ -156,6 +156,31 @@ export function renderDashboard(data, repoPath, opts = {}) {
   const sections = [];
   const header = stats?.header || {};
 
+  // --- Doctor (`stats.doctor`, absent from older mdkb) ---
+  // First, because a finding is something to act on. Read from `stats`, not
+  // `mdkb doctor`: execCli drops stdout on a non-zero exit, and doctor exits
+  // non-zero exactly when it has an error to show.
+  if (stats?.doctor?.length) {
+    const SEVERITY_BADGE = { error: "badge-error", warning: "badge-warn", info: "badge-muted" };
+    const rows = stats.doctor.map((f) =>
+      `<tr>
+        <td><span class="badge ${SEVERITY_BADGE[f.severity] || "badge-muted"}">${esc(f.severity)}</span></td>
+        <td><code>${esc(f.id)}</code></td>
+        <td>${esc(f.message)}</td>
+        <td>${f.fix ? `<code>${esc(f.fix)}</code>` : ""}</td>
+      </tr>`
+    ).join("");
+    sections.push(`
+      <div class="dash-section">
+        <h2 class="dash-section-title">Doctor <span class="dash-section-hint">mdkb doctor --full for the live distiller probe</span></h2>
+        <table>
+          <thead><tr><th>Severity</th><th>Check</th><th>Finding</th><th>Fix</th></tr></thead>
+          <tbody>${rows}</tbody>
+        </table>
+      </div>
+    `);
+  }
+
   // --- Overview (index) ---
   if (stats?.index) {
     const idx = stats.index;
@@ -320,6 +345,40 @@ export function renderDashboard(data, repoPath, opts = {}) {
         <table>
           <thead><tr><th>Event</th><th class="num">Calls</th><th class="num">Fired</th><th class="num">Avg ms</th><th class="num">p95 ms</th></tr></thead>
           <tbody>${rows}</tbody>
+        </table>
+      </div>
+    `);
+  }
+
+  // --- Recall ledger (`stats.recall`, absent from older mdkb) ---
+  const recall = stats?.recall;
+  if (recall && Object.keys(recall.prompts_by_mode || {}).length) {
+    const modes = Object.entries(recall.prompts_by_mode)
+      .map(([mode, n]) => `<span class="badge badge-muted">${esc(mode)} ${n}</span>`)
+      .join(" ");
+    const labelled = recall.insufficient_data
+      ? `<span class="badge badge-warn">${recall.labelled} labelled — insufficient data</span>`
+      : `<span class="badge badge-success">${recall.labelled} labelled</span>`;
+    const bandRows = (bands, holdout) => bands.map((b) =>
+      `<tr>
+        <td><code>${esc(b.band)}</code>${holdout ? ' <span class="badge badge-muted">holdout</span>' : ""}</td>
+        <td>${esc(b.entry_type)}</td>
+        <td class="num">${b.offered}</td>
+        <td class="num">${b.injected}</td>
+        <td class="num">${b.labelled}</td>
+        <td class="num">${b.positive}</td>
+        <td class="num">${b.negative}</td>
+        <td class="num">${b.missed}</td>
+        <td class="num">${b.precision == null ? "–" : Math.round(b.precision * 100) + "%"}</td>
+      </tr>`
+    ).join("");
+    sections.push(`
+      <div class="dash-section">
+        <h2 class="dash-section-title">Recall <span class="dash-section-hint">candidates offered per cosine band</span></h2>
+        <div class="badge-row">${modes} ${labelled}</div>
+        <table>
+          <thead><tr><th>Band</th><th>Type</th><th class="num">Offered</th><th class="num">Injected</th><th class="num">Labelled</th><th class="num">+</th><th class="num">−</th><th class="num">Missed</th><th class="num">Precision</th></tr></thead>
+          <tbody>${bandRows(recall.bands || [], false)}${bandRows(recall.holdout || [], true)}</tbody>
         </table>
       </div>
     `);
