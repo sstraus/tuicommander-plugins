@@ -39,7 +39,7 @@
     "description": "View mdkb knowledge base status, collections, memories, and configuration in an interactive panel.",
     "author": "sstraus",
     "repo": "sstraus/tuicommander-plugins",
-    "latestVersion": "1.1.0",
+    "latestVersion": "1.3.0",
     "minAppVersion": "0.3.0",
     "capabilities": ["exec:cli", "fs:read", "ui:panel", "ui:ticker", "ui:context-menu"],
     "downloadUrl": "https://github.com/sstraus/tuicommander-plugins/releases/latest/download/mdkb-dashboard.zip"
@@ -61,7 +61,7 @@
     "description": "Prevents Claude API prompt cache expiry by sending minimal keepalive messages during idle periods.",
     "author": "sstraus",
     "repo": "sstraus/tuicommander-plugins",
-    "latestVersion": "1.0.0",
+    "latestVersion": "1.1.0",
     "minAppVersion": "0.9.8",
     "capabilities": ["pty:write", "ui:ticker", "fs:read", "fs:list"],
     "downloadUrl": "https://github.com/sstraus/tuicommander-plugins/releases/latest/download/cache-keepalive.zip"
