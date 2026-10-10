@@ -52,3 +52,5 @@ Open a PR adding your entry to `registry.json`. Requirements:
 ## Plugin development
 
 See the [plugin docs](https://github.com/sstraus/tuicommander/blob/main/docs/plugins.md) for the full API reference and examples.
+
+Join [TUICommander & Co on Discord](https://discord.gg/4DQ7Ah6hSh) and use **#plugins** in the **TUICommander** category to showcase and discuss plugins, ask for plugin development help, or request plugins. The server is checked once a day. Report reproducible bugs in [GitHub issues](https://github.com/sstraus/tuicommander-plugins/issues).
