@@ -30,7 +30,12 @@ function sampleWorkbook() {
 		wb,
 		XLSX.utils.aoa_to_sheet([
 			HEADER_ROW,
-			["Bolt", 3, new Date(Date.UTC(2026, 0, 15))],
+			// Local-time constructor, not `Date.UTC(...)`: SheetJS reads a Date's
+			// display components (year/month/day) via local-time getters, not UTC, so a
+			// UTC-midnight timestamp reads back as the day before in any negative-UTC-
+			// offset timezone — this made the assertion below flake between "1/15/26"
+			// and "1/14/26" depending on the machine running it.
+			["Bolt", 3, new Date(2026, 0, 15)],
 			[HOSTILE_CELL, 12, ""],
 		]),
 		"Parts",
